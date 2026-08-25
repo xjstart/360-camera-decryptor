@@ -12,6 +12,8 @@ services:
     volumes:
       # 挂载配置文件，方便在主机修改
       - ../backend/data/config.yaml:/app/backend/data/config.yaml
+      # MP4 录像分片持久化到宿主机，容器重建后仍保留
+      - ../backend/data/recordings:/app/backend/data/recordings
       # 挂载缓存目录，避免容器重启后重复下载 libffmpeg.js
       - camera-cache:/app/backend/.cache
     environment:

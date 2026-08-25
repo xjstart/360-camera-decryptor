@@ -183,6 +183,49 @@
                 </div>
                 <p class="input-note" style="color: var(--muted);">新后端会优先生成服务端解密后的 MPEG-TS 拉流地址；如果检测到你还在运行旧后端，页面会自动回退到原始 FLV 代理模式。</p>
             </div>
+
+            <div class="recording-section panel" id="recording-section">
+                <div class="section-header">
+                    <h2>⏺️ 录像控制</h2>
+                    <span class="section-badge" id="recording-state-badge">空闲</span>
+                </div>
+                <div class="recording-toolbar">
+                    <div class="input-group recording-path-field">
+                        <label class="input-label" for="recording-output-root">录像文件保存路径</label>
+                        <input id="recording-output-root" class="text-input" type="text" placeholder="例如：F:\homemonitor\360home">
+                    </div>
+                    <div class="input-group recording-duration-field">
+                        <label class="input-label" for="recording-segment-seconds">MP4 分片时长（秒）</label>
+                        <input id="recording-segment-seconds" class="text-input" type="number" value="1800" min="10" max="86400" step="1">
+                    </div>
+                    <div class="recording-config-summary">
+                        <span class="summary-label">录像解密配置</span>
+                        <span class="summary-value" id="recording-current-config">配置 0</span>
+                    </div>
+                    <div class="button-group compact-buttons recording-buttons">
+                        <button id="recording-action-button" onclick="toggleRecording()" data-mode="start">开始录像</button>
+                    </div>
+                </div>
+                <div class="recording-status-grid">
+                    <div class="info-item">
+                        <div class="info-label">任务 ID</div>
+                        <div class="info-value" id="recording-id">-</div>
+                    </div>
+                    <div class="info-item">
+                        <div class="info-label">开始时间</div>
+                        <div class="info-value" id="recording-started-at">-</div>
+                    </div>
+                    <div class="info-item">
+                        <div class="info-label">已生成片段</div>
+                        <div class="info-value" id="recording-segment-count">0</div>
+                    </div>
+                    <div class="info-item">
+                        <div class="info-label">输出目录</div>
+                        <div class="info-value" id="recording-output-dir">-</div>
+                    </div>
+                </div>
+                <p class="input-note" id="recording-message">请选择保存路径和摄像机。录像文件会按日期保存到 `YYYY-MM-DD` 目录。</p>
+            </div>
             
             <!-- 解密配置 -->
             <div class="config-section panel" id="config-section">

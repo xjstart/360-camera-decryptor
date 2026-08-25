@@ -41,6 +41,27 @@ def terminate_process_tree(
         if logger:
             logger(message, args)
 
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=timeout,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            warn("%s failed to terminate Windows process tree: %s", label, exc)
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        try:
+            proc.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            warn("%s still running after taskkill", label)
+        return proc.poll()
+
     try:
         os.killpg(proc.pid, signal.SIGTERM)
     except ProcessLookupError:

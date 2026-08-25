@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import atexit
 import os
 import re
 import time
@@ -19,7 +20,9 @@ from flask import Flask, Response, jsonify, request, send_from_directory, stream
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 from .api_client import CameraAPIRequest
-from .paths import BACKEND_DIR, NODE_DECRYPT_SCRIPT, ROOT_DIR, WEB_DIR, ConfigError
+from .decrypt_commands import SUPPORTED_CONFIG_IDS, build_decrypt_command
+from .paths import BACKEND_DIR, ROOT_DIR, WEB_DIR, ConfigError
+from .recordings import RecordingConflict, RecordingManager
 from .stream_sessions import SharedDecryptSessionManager
 
 
@@ -75,6 +78,25 @@ class CameraBackendService:
             cache_dir = ROOT_DIR / cache_dir
         cache_dir.mkdir(parents=True, exist_ok=True)
         return cache_dir
+
+    def get_recording_dir(self, override: Optional[str] = None) -> Path:
+        """返回录像根目录；网页可以为当前录像覆盖默认配置。"""
+        server_config = self.load_config().get("server", {})
+        configured = str(override or server_config.get("recording_dir") or "").strip()
+        configured = os.path.expandvars(os.path.expanduser(configured))
+        recording_dir = Path(configured) if configured else self.data_dir / "recordings"
+        if not recording_dir.is_absolute():
+            recording_dir = ROOT_DIR / recording_dir
+        # 不使用 Path.resolve()：部分 Windows 云盘/虚拟盘虽然可以正常读写，
+        # 但不支持查询底层卷的真实路径，会因此抛出 WinError 1005。
+        recording_dir = Path(os.path.abspath(os.path.normpath(os.fspath(recording_dir))))
+        recording_dir.mkdir(parents=True, exist_ok=True)
+        return recording_dir
+
+    @staticmethod
+    def safe_path_component(value: str, fallback: str = "unknown") -> str:
+        normalized = re.sub(r"[^a-zA-Z0-9_.-]+", "_", value).strip("_")
+        return fallback if normalized in {"", ".", ".."} else normalized
 
     def get_decrypt_stream_options(self) -> Dict[str, int]:
         """读取服务端解密管线的限流/超时配置。
@@ -189,7 +211,7 @@ class CameraBackendService:
 
     def _get_cache_file_path(self, sn: str) -> Path:
         """把摄像机 SN 转成安全文件名，避免特殊字符逃出缓存目录。"""
-        safe_sn = re.sub(r"[^a-zA-Z0-9_.-]+", "_", sn).strip("_") or "unknown"
+        safe_sn = self.safe_path_component(sn)
         return self.get_play_info_cache_dir() / f"{safe_sn}.json"
 
     def _load_persisted_play_info(self, sn: str) -> Optional[Dict[str, Any]]:
@@ -443,6 +465,8 @@ service = CameraBackendService(os.environ.get("CAMERA_CONFIG_PATH"))
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1, x_port=1)
 decrypt_session_manager = SharedDecryptSessionManager(logger=app.logger, cwd=ROOT_DIR)
+recording_manager = RecordingManager(logger=app.logger, cwd=ROOT_DIR)
+atexit.register(recording_manager.close_all)
 
 
 def add_cors_headers(response: Response) -> Response:
@@ -470,6 +494,13 @@ def build_go2rtc_response(sn: Optional[str] = None, mode: str = "raw", config_id
 def build_decrypt_group_key(config_id: int, sn: str) -> str:
     """同一摄像机和同一解密配置共用一个进程组标识。"""
     return json.dumps({"config_id": config_id, "sn": sn}, sort_keys=True, ensure_ascii=True)
+
+
+def get_decrypt_payload(sn: str, *, force_refresh: bool = False) -> Dict[str, Any]:
+    payload = service.get_play_info_for_stream(sn, force_refresh=force_refresh)
+    if payload.get("errorCode") != 0:
+        raise ConfigError(payload.get("errorMsg", "未获取到播放信息"))
+    return payload
 
 
 @app.after_request
@@ -619,63 +650,17 @@ def decrypted_stream(config_id: str, sn: str) -> Response:
         # 前端失败后重试会带 refresh=1，此时必须替换同摄像机/配置的旧进程，
         # 否则旧 Node/ffmpeg 可能继续消耗 CPU 和内存。
         replace_group = force_refresh or request.args.get("replace") == "1"
-        payload = service.get_play_info_for_stream(sn, force_refresh=force_refresh)
-        if payload.get("errorCode") != 0:
-            raise ConfigError(payload.get("errorMsg", "未获取到播放信息"))
-        play_key = payload.get("playKey")
-        flash_url = payload.get("flashUrl")
-        if not flash_url:
-            raise ConfigError("播放信息缺少 flashUrl，无法启动服务端解密")
-        if not NODE_DECRYPT_SCRIPT.is_file():
-            return jsonify({"error": f"缺少解密脚本: {NODE_DECRYPT_SCRIPT}"}), 500
-
+        payload = get_decrypt_payload(sn, force_refresh=force_refresh)
         fps = (request.args.get("fps") or "12").strip()
         output_format = (request.args.get("format") or "mpegts").strip().lower()
-        if output_format not in {"mpegts", "mp4"}:
-            return jsonify({"error": "format 仅支持 mpegts 或 mp4"}), 400
-        relay_sig = payload.get("relaySig") or ""
         decrypt_options = service.get_decrypt_stream_options()
-
-        cmd = [
-            "node",
-            str(NODE_DECRYPT_SCRIPT),
-            "--url",
-            flash_url,
-            "--fps",
-            fps,
-            "--quiet",
-            "--network-chunk-size",
-            str(decrypt_options["decrypt_network_chunk_size"]),
-            "--max-pending-input-bytes",
-            str(decrypt_options["decrypt_max_pending_input_bytes"]),
-            "--max-pending-video-bytes",
-            str(decrypt_options["decrypt_max_pending_video_bytes"]),
-            "--max-pending-audio-bytes",
-            str(decrypt_options["decrypt_max_pending_audio_bytes"]),
-            "--ffmpeg-threads",
-            str(decrypt_options["decrypt_ffmpeg_threads"]),
-            "--output-format",
-            output_format,
-        ]
-
-        if config_id_int == 0:
-            if not play_key:
-                raise ConfigError("播放信息缺少 playKey，无法启动服务端解密")
-            cmd.extend(["--play-key", play_key, "--key-type", "0"])
-        elif config_id_int == 1:
-            if not play_key:
-                raise ConfigError("播放信息缺少 playKey，无法启动服务端解密")
-            cmd.extend(["--play-key", play_key, "--key-type", "1"])
-        elif config_id_int == 2:
-            cmd.extend(["--key-type", "0"])
-        elif config_id_int == 3:
-            if not play_key:
-                raise ConfigError("播放信息缺少 playKey，无法启动服务端解密")
-            cmd.extend(["--play-key", play_key, "--key-type", "0"])
-            if relay_sig:
-                cmd.extend(["--relay-sig", relay_sig])
-        else:
-            return jsonify({"error": f"不支持的 config_id: {config_id_int}，支持的配置ID为 0-3"}), 400
+        cmd = build_decrypt_command(
+            config_id=config_id_int,
+            payload=payload,
+            decrypt_options=decrypt_options,
+            fps=fps,
+            output_format=output_format,
+        )
 
         session_key = json.dumps(
             {
@@ -683,9 +668,9 @@ def decrypted_stream(config_id: str, sn: str) -> Response:
                 "sn": sn,
                 "fps": fps,
                 "output_format": output_format,
-                "flash_url": flash_url,
-                "play_key": play_key or "",
-                "relay_sig": relay_sig if config_id_int == 3 else "",
+                "flash_url": payload.get("flashUrl") or "",
+                "play_key": payload.get("playKey") or "",
+                "relay_sig": (payload.get("relaySig") or "") if config_id_int == 3 else "",
             },
             sort_keys=True,
             ensure_ascii=True,
@@ -725,6 +710,96 @@ def decrypted_stream(config_id: str, sn: str) -> Response:
 
     content_type = "video/mp4" if output_format == "mp4" else "video/mp2t"
     return Response(stream_with_context(generate()), content_type=content_type)
+
+
+@app.route("/api/recordings/start", methods=["POST"])
+def start_recording() -> Response:
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"error": "请求体必须是 JSON 对象"}), 400
+    sn = str(body.get("sn") or "").strip()
+    if not sn:
+        return jsonify({"error": "缺少 sn 参数"}), 400
+    raw_config_id = body.get("config_id", 0)
+    raw_segment_seconds = body.get("segment_seconds", 1800)
+    raw_recording_dir = body.get("recording_dir")
+    if isinstance(raw_config_id, bool) or isinstance(raw_segment_seconds, bool):
+        return jsonify({"error": "config_id 和 segment_seconds 必须是整数"}), 400
+    if raw_recording_dir is not None and not isinstance(raw_recording_dir, str):
+        return jsonify({"error": "recording_dir 必须是路径字符串"}), 400
+    try:
+        config_id = int(raw_config_id)
+        segment_seconds = int(raw_segment_seconds)
+    except (TypeError, ValueError):
+        return jsonify({"error": "config_id 和 segment_seconds 必须是整数"}), 400
+    if config_id not in SUPPORTED_CONFIG_IDS:
+        return jsonify({"error": "config_id 仅支持 0-3"}), 400
+    if segment_seconds < 10 or segment_seconds > 86400:
+        return jsonify({"error": "segment_seconds 必须在 10-86400 之间"}), 400
+
+    try:
+        service.find_camera(sn)
+        if recording_manager.has_active(sn):
+            raise RecordingConflict(f"摄像机 {sn} 已在录制")
+        payload = get_decrypt_payload(sn)
+        decrypt_options = service.get_decrypt_stream_options()
+
+        def cmd_factory(output_pattern: Path) -> list[str]:
+            return build_decrypt_command(
+                config_id=config_id,
+                payload=payload,
+                decrypt_options=decrypt_options,
+                fps="12",
+                output_format="mp4",
+                output_path=output_pattern,
+                segment_seconds=segment_seconds,
+                segment_strftime=True,
+                control_stdin=True,
+            )
+
+        status = recording_manager.start(
+            sn=sn,
+            config_id=config_id,
+            segment_seconds=segment_seconds,
+            output_root=service.get_recording_dir(raw_recording_dir),
+            cmd_factory=cmd_factory,
+        )
+    except RecordingConflict as exc:
+        return jsonify({"error": str(exc), "recording": recording_manager.status(sn)}), 409
+    except ConfigError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except (OSError, ValueError) as exc:
+        return jsonify({"error": f"录像保存路径或进程不可用: {exc}"}), 500
+    return jsonify({"ok": True, "recording": status}), 201
+
+
+@app.route("/api/recordings/settings")
+def recording_settings() -> Response:
+    try:
+        recording_dir = service.get_recording_dir()
+    except (ConfigError, OSError, ValueError) as exc:
+        return jsonify({"error": f"读取录像设置失败: {exc}"}), 500
+    return jsonify(
+        {
+            "recording_dir": str(recording_dir),
+            "default_segment_seconds": 1800,
+            "directory_layout": "YYYY-MM-DD/manual-YYYY-MM-DD_HH-MM-SS-<id>.mp4",
+        }
+    )
+
+
+@app.route("/api/recordings/status")
+def recording_status() -> Response:
+    sn = (request.args.get("sn") or "").strip()
+    if not sn:
+        return jsonify({"error": "缺少 sn 参数"}), 400
+    return jsonify({"recording": recording_manager.status(sn)})
+
+
+@app.route("/api/recordings/<sn>/stop", methods=["POST"])
+def stop_recording(sn: str) -> Response:
+    stopped, status = recording_manager.stop(sn)
+    return jsonify({"ok": True, "stopped": stopped, "recording": status})
 
 
 @app.route("/api/decrypted-stream/<config_id>/<sn>/stop", methods=["POST"])

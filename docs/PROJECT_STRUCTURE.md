@@ -8,12 +8,15 @@
 │   ├── app/                  # 后端核心代码
 │   │   ├── api_client.py     # 360 平台 API 低层请求
 │   │   ├── cli.py            # CLI 入口逻辑
+│   │   ├── decrypt_commands.py # Node 解密命令构建
+│   │   ├── recordings.py       # MP4 分片录像任务管理
 │   │   └── service.py        # Flask 服务与批量同步逻辑
 │   ├── server.py             # Flask 服务兼容入口
 │   ├── config.example.yaml   # 配置模板
 │   ├── data/                 # 配置与运行期缓存
-│   │   ├── config.yaml           # 本地配置
-│   │   └── play_info_cache/      # 播放信息持久化缓存
+│   │   ├── config.yaml       # 本地配置
+│   │   ├── play_info_cache/  # 播放信息持久化缓存
+│   │   └── recordings/       # 运行期 MP4 录像分片
 ├── frontend/                 # 前端调试页与播放器资源
 ├── docs/                     # 文档
 │   ├── PROJECT_STRUCTURE.md

@@ -12,5 +12,7 @@ Thumbs.db
 save_web/
 
 # Runtime cache
+.venv/
 backend/.cache/
 backend/libffmpeg.wasm
+backend/data/recordings/

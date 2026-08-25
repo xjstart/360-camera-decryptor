@@ -31,6 +31,8 @@ server:
   play_info_cache_seconds: 30
   # 播放信息本地持久化目录；留空时默认使用 backend/data/play_info_cache
   play_info_cache_dir: ""
+  # MP4 录像分片默认保存目录；留空时使用 backend/data/recordings，网页可为当前录像覆盖
+  recording_dir: ""
   # 部署在反向代理后面时，显式指定前端可访问的后端公网地址
   # 例如: "https://you.domain.com"
   public_base_url: ""

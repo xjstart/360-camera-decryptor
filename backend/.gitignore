@@ -4,6 +4,7 @@ config.yaml
 output/
 data/config.yaml
 data/play_info_cache/
+data/recordings/
 
 # Python
 __pycache__/

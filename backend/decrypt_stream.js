@@ -121,6 +121,8 @@ class FfmpegTsMuxer {
     audioSampleFormat,
     outputPath,
     outputFormat,
+    segmentSeconds,
+    segmentStrftime,
     quiet,
     maxPendingVideoBytes,
     maxPendingAudioBytes,
@@ -153,16 +155,33 @@ class FfmpegTsMuxer {
         ]
       : ["-an"];
     const normalizedOutputFormat = outputFormat === "mp4" ? "mp4" : "mpegts";
-    const outputArgs = normalizedOutputFormat === "mp4"
+    const normalizedSegmentSeconds = Math.max(0, Number(segmentSeconds || 0));
+    const outputArgs = normalizedSegmentSeconds > 0
       ? [
+          "-f",
+          "segment",
+          "-segment_time",
+          String(normalizedSegmentSeconds),
+          "-reset_timestamps",
+          "1",
+          "-segment_start_number",
+          "1",
+          "-segment_format",
+          "mp4",
+          "-segment_format_options",
+          "movflags=+faststart",
+          ...(segmentStrftime ? ["-strftime", "1"] : []),
+        ]
+      : normalizedOutputFormat === "mp4"
+        ? [
           "-movflags",
           "frag_keyframe+empty_moov+default_base_moof+omit_tfhd_offset",
           "-frag_duration",
           "1000000",
           "-f",
           "mp4",
-        ]
-      : ["-f", "mpegts"];
+          ]
+        : ["-f", "mpegts"];
     const ffmpegArgs = [
       "-loglevel",
       "error",
@@ -225,6 +244,9 @@ class FfmpegTsMuxer {
     this.audioDraining = false;
     this.closed = false;
     this.lastError = null;
+    this.exitPromise = new Promise((resolve) => {
+      this.resolveExit = resolve;
+    });
 
     const onProcessExit = (error) => {
       this.lastError = error || this.lastError || new Error("FFmpeg 已退出");
@@ -233,6 +255,10 @@ class FfmpegTsMuxer {
       this.audioQueue.length = 0;
       this.videoQueuedBytes = 0;
       this.audioQueuedBytes = 0;
+      if (this.resolveExit) {
+        this.resolveExit(error || null);
+        this.resolveExit = null;
+      }
     };
 
     this.process.once("error", (error) => onProcessExit(error));
@@ -337,6 +363,9 @@ class FfmpegTsMuxer {
   }
 
   close() {
+    if (this.closed) {
+      return;
+    }
     this.closed = true;
     if (this.videoIn && this.videoIn.writable) {
       this.videoIn.end();
@@ -350,6 +379,18 @@ class FfmpegTsMuxer {
     this.close();
     if (this.process && !this.process.killed) {
       this.process.kill(signalName);
+    }
+  }
+
+  async waitForExit(timeoutMs = 10000) {
+    let timeoutId;
+    const timeout = new Promise((_, reject) => {
+      timeoutId = setTimeout(() => reject(new Error("等待 FFmpeg 封装结束超时")), timeoutMs);
+    });
+    try {
+      return await Promise.race([this.exitPromise, timeout]);
+    } finally {
+      clearTimeout(timeoutId);
     }
   }
 }
@@ -408,6 +449,8 @@ class CameraWasmDecoder {
           audioSampleFormat: this.audioSampleFormat,
           outputPath: this.outputPath,
           outputFormat: this.options.outputFormat,
+          segmentSeconds: this.options.segmentSeconds,
+          segmentStrftime: this.options.segmentStrftime,
           quiet: this.quiet,
           maxPendingVideoBytes: this.maxPendingVideoBytes,
           maxPendingAudioBytes: this.maxPendingAudioBytes,
@@ -582,6 +625,12 @@ class CameraWasmDecoder {
       this.ffmpegMuxer.close();
     }
   }
+
+  async waitForMuxerExit(timeoutMs = 10000) {
+    if (this.ffmpegMuxer) {
+      await this.ffmpegMuxer.waitForExit(timeoutMs);
+    }
+  }
 }
 
 async function* chunkFromFile(filePath, chunkSize) {
@@ -602,7 +651,7 @@ async function* chunkFromFile(filePath, chunkSize) {
   }
 }
 
-async function* chunkFromFetch(url, chunkSize, quiet) {
+async function* chunkFromFetch(url, chunkSize, quiet, signal) {
   log(`fetch stream: ${url}`, quiet);
   const response = await fetch(url, {
     headers: {
@@ -610,6 +659,7 @@ async function* chunkFromFetch(url, chunkSize, quiet) {
       "User-Agent": "Mozilla/5.0",
       Accept: "*/*",
     },
+    signal,
   });
   if (!response.ok || !response.body) {
     throw new Error(`拉取视频流失败: HTTP ${response.status}`);
@@ -631,10 +681,6 @@ async function main() {
   if (!args.url && !args["input-file"]) {
     throw new Error("需要传入 --url 或 --input-file");
   }
-  if (!args["play-key"]) {
-    throw new Error("需要传入 --play-key");
-  }
-
   const quiet = Boolean(args.quiet);
   const libffmpegUrl = args["libffmpeg-url"] || process.env.CAMERA_LIBFFMPEG_URL || DEFAULT_LIBFFMPEG_URL;
   const libffmpegPath = path.resolve(args["libffmpeg-path"] || DEFAULT_LIBFFMPEG_PATH);
@@ -649,6 +695,8 @@ async function main() {
     fps: args.fps || 12,
     outputPath: args.output || "",
     outputFormat: args["output-format"] || "mpegts",
+    segmentSeconds: args["segment-seconds"] || 0,
+    segmentStrftime: Boolean(args["segment-strftime"]),
     maxFrames: args["max-frames"] || 0,
     maxPendingVideoBytes: args["max-pending-video-bytes"] || 8 * 1024 * 1024,
     maxPendingAudioBytes: args["max-pending-audio-bytes"] || 2 * 1024 * 1024,
@@ -659,23 +707,40 @@ async function main() {
   activeDecoder = decoder;
   await decoder.init();
 
+  if (args["control-stdin"]) {
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", handleControlInput);
+    process.stdin.resume();
+  }
+
+  activeAbortController = new AbortController();
+
   const source = args["input-file"]
     ? chunkFromFile(path.resolve(args["input-file"]), chunkSize)
-    : chunkFromFetch(args.url, chunkSize, quiet);
+    : chunkFromFetch(args.url, chunkSize, quiet, activeAbortController.signal);
 
-  for await (const chunk of source) {
-    while (decoder.isBackpressured() && !decoder.ended) {
+  try {
+    for await (const chunk of source) {
+      while (decoder.isBackpressured() && !decoder.ended) {
+        decoder.flushInput();
+        decoder.maybeOpen();
+        decoder.pumpDecode(32);
+        await sleep(10);
+      }
+      if (decoder.ended) {
+        break;
+      }
+      decoder.enqueue(chunk);
       decoder.flushInput();
       decoder.maybeOpen();
-      decoder.pumpDecode(32);
-      await sleep(10);
+      decoder.pumpDecode();
+      if (decoder.ended) {
+        break;
+      }
     }
-    decoder.enqueue(chunk);
-    decoder.flushInput();
-    decoder.maybeOpen();
-    decoder.pumpDecode();
-    if (decoder.ended) {
-      break;
+  } catch (error) {
+    if (!stopRequested || error.name !== "AbortError") {
+      throw error;
     }
   }
 
@@ -687,24 +752,68 @@ async function main() {
   }
 
   decoder.finish();
+  await decoder.waitForMuxerExit(8000);
   log(
     `decoder finished: videoFrames=${decoder.videoFrames} audioFrames=${decoder.audioFrames} droppedVideoFrames=${decoder.droppedVideoFrames} droppedAudioFrames=${decoder.droppedAudioFrames}`,
     quiet
   );
+  cleanupControlInput();
+  activeAbortController = null;
   activeDecoder = null;
 }
 
 let activeDecoder = null;
+let activeAbortController = null;
+let stopRequested = false;
+let controlInputBuffer = "";
 
-function shutdown(signalName) {
-  if (activeDecoder && activeDecoder.ffmpegMuxer) {
-    activeDecoder.ffmpegMuxer.terminate(signalName);
+function requestGracefulStop() {
+  if (stopRequested) {
+    return;
   }
-  process.exit(0);
+  stopRequested = true;
+  if (activeDecoder) {
+    activeDecoder.finish();
+  }
+  if (activeAbortController) {
+    activeAbortController.abort();
+  }
 }
 
-process.once("SIGINT", () => shutdown("SIGINT"));
-process.once("SIGTERM", () => shutdown("SIGTERM"));
+function handleControlInput(rawText) {
+  controlInputBuffer += String(rawText);
+  const lines = controlInputBuffer.split(/\r?\n/);
+  controlInputBuffer = lines.pop() || "";
+  for (const line of lines) {
+    if (line.trim().toLowerCase() === "stop") {
+      requestGracefulStop();
+    }
+  }
+}
+
+function cleanupControlInput() {
+  process.stdin.off("data", handleControlInput);
+  process.stdin.pause();
+}
+
+async function shutdown(signalName) {
+  requestGracefulStop();
+  try {
+    if (activeDecoder) {
+      await activeDecoder.waitForMuxerExit(8000);
+    }
+  } catch (error) {
+    if (activeDecoder && activeDecoder.ffmpegMuxer) {
+      activeDecoder.ffmpegMuxer.terminate(signalName);
+    }
+  } finally {
+    cleanupControlInput();
+    process.exit(0);
+  }
+}
+
+process.once("SIGINT", () => void shutdown("SIGINT"));
+process.once("SIGTERM", () => void shutdown("SIGTERM"));
 
 main().catch((error) => {
   if (activeDecoder && activeDecoder.ffmpegMuxer) {

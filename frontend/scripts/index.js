@@ -7,6 +7,9 @@ let backendStreamConfigId = null;
 let backendStreamSn = '';
 let backendStreamAbortController = null;
 let backendStreamObjectUrl = '';
+let recordingPollTimer = null;
+let recordingPollSn = '';
+let recordingActiveState = 'idle';
 
 function getDefaultBackendBaseUrl() {
     if (window.location.protocol === 'http:' || window.location.protocol === 'https:') {
@@ -90,6 +93,11 @@ function syncCameraSelection() {
     const snInput = document.getElementById('camera-sn-input');
     if (select.value) {
         snInput.value = select.value;
+        localStorage.setItem('cameraDecryptorSelectedSn', select.value);
+        refreshRecordingStatus(select.value);
+    } else {
+        snInput.value = '';
+        refreshRecordingStatus('');
     }
 }
 
@@ -119,6 +127,19 @@ async function loadCameraList() {
             option.textContent = `${camera.name || camera.sn} (${camera.api_version || 'v2'})`;
             select.appendChild(option);
         });
+
+        const savedSn = localStorage.getItem('cameraDecryptorSelectedSn') || '';
+        if (savedSn && cameras.some((camera) => camera.sn === savedSn)) {
+            select.value = savedSn;
+            document.getElementById('camera-sn-input').value = savedSn;
+            refreshRecordingStatus(savedSn);
+        } else {
+            const defaultCamera = cameras[0];
+            select.value = defaultCamera.sn;
+            document.getElementById('camera-sn-input').value = defaultCamera.sn;
+            localStorage.setItem('cameraDecryptorSelectedSn', defaultCamera.sn);
+            refreshRecordingStatus(defaultCamera.sn);
+        }
 
         log(`已加载 ${cameras.length} 个摄像机`, 'success');
     } catch (error) {
@@ -213,6 +234,248 @@ function displayVideoInfo() {
 
 function getCurrentCameraSn() {
     return (apiResponse && (apiResponse.camera_sn || apiResponse.sn)) || document.getElementById('camera-sn-input').value.trim();
+}
+
+function getRecordingCameraSn() {
+    const input = document.getElementById('camera-sn-input');
+    return input ? input.value.trim() : '';
+}
+
+function formatRecordingTime(value) {
+    if (!value) {
+        return '-';
+    }
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+}
+
+function formatSegmentDuration(seconds) {
+    if (seconds % 3600 === 0) {
+        return `${seconds / 3600} 小时`;
+    }
+    if (seconds % 60 === 0) {
+        return `${seconds / 60} 分钟`;
+    }
+    return `${seconds} 秒`;
+}
+
+async function loadRecordingSettings() {
+    const pathInput = document.getElementById('recording-output-root');
+    const durationInput = document.getElementById('recording-segment-seconds');
+    try {
+        const response = await fetch(buildApiUrl('/api/recordings/settings'), { cache: 'no-store' });
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok || result.error) {
+            throw new Error(result.error || `HTTP ${response.status}`);
+        }
+        if (recordingActiveState !== 'recording' && recordingActiveState !== 'stopping') {
+            const savedPath = localStorage.getItem('cameraDecryptorRecordingDir') || '';
+            pathInput.value = savedPath || result.recording_dir || '';
+            durationInput.value = result.default_segment_seconds || 1800;
+        }
+    } catch (error) {
+        durationInput.value = 1800;
+        log(`读取录像设置失败: ${error.message}`, 'warning');
+    }
+}
+
+function updateRecordingConfigDisplay(configId = null) {
+    const value = configId !== null ? configId : (currentConfigId !== null ? currentConfigId : 0);
+    const element = document.getElementById('recording-current-config');
+    if (element) {
+        element.textContent = `配置 ${value}`;
+    }
+}
+
+function stopRecordingPolling() {
+    if (recordingPollTimer) {
+        clearTimeout(recordingPollTimer);
+        recordingPollTimer = null;
+    }
+    recordingPollSn = '';
+}
+
+function scheduleRecordingPoll(sn) {
+    stopRecordingPolling();
+    recordingPollSn = sn;
+    recordingPollTimer = setTimeout(() => {
+        refreshRecordingStatus(sn, true);
+    }, 2000);
+}
+
+function renderRecordingStatus(recording) {
+    const state = recording.state || 'idle';
+    const active = state === 'recording' || state === 'stopping';
+    recordingActiveState = state;
+    const stateLabels = {
+        idle: '空闲',
+        recording: '录制中',
+        stopping: '停止中',
+        stopped: '已停止',
+        failed: '失败'
+    };
+    document.getElementById('recording-state-badge').textContent = stateLabels[state] || state;
+    document.getElementById('recording-id').textContent = recording.recording_id || '-';
+    document.getElementById('recording-started-at').textContent = formatRecordingTime(recording.started_at);
+    document.getElementById('recording-segment-count').textContent = String(recording.segment_count || 0);
+    document.getElementById('recording-output-dir').textContent = recording.output_dir || recording.relative_output_dir || '-';
+    const actionButton = document.getElementById('recording-action-button');
+    const durationInput = document.getElementById('recording-segment-seconds');
+    const pathInput = document.getElementById('recording-output-root');
+    if (state === 'recording') {
+        actionButton.textContent = '停止录像';
+        actionButton.dataset.mode = 'stop';
+        actionButton.disabled = false;
+        actionButton.classList.add('recording-stop-button');
+    } else if (state === 'stopping') {
+        actionButton.textContent = '停止中...';
+        actionButton.dataset.mode = 'stop';
+        actionButton.disabled = true;
+        actionButton.classList.add('recording-stop-button');
+    } else {
+        actionButton.textContent = '开始录像';
+        actionButton.dataset.mode = 'start';
+        actionButton.disabled = false;
+        actionButton.classList.remove('recording-stop-button');
+    }
+    durationInput.disabled = active;
+    pathInput.disabled = active;
+    if (recording.segment_seconds) {
+        durationInput.value = recording.segment_seconds;
+    }
+    if (recording.recording_dir) {
+        pathInput.value = recording.recording_dir;
+        localStorage.setItem('cameraDecryptorRecordingDir', recording.recording_dir);
+    }
+    updateRecordingConfigDisplay(recording.config_id !== undefined ? recording.config_id : null);
+
+    const message = document.getElementById('recording-message');
+    if (recording.error) {
+        message.textContent = recording.error;
+        message.style.color = '#b91c1c';
+    } else if (active) {
+        message.textContent = `正在录制，每 ${formatSegmentDuration(recording.segment_seconds)} 生成一个 MP4 分片。点击“停止录像”即可结束。`;
+        message.style.color = '';
+    } else if (state === 'stopped') {
+        message.textContent = '录像已停止，最后一个 MP4 分片已完成封装。';
+        message.style.color = '';
+    } else {
+        message.textContent = '请选择保存路径和摄像机。录像文件会按日期保存到 `YYYY-MM-DD` 目录。';
+        message.style.color = '';
+    }
+
+    if (active) {
+        scheduleRecordingPoll(recording.sn || getRecordingCameraSn());
+    } else {
+        stopRecordingPolling();
+    }
+}
+
+async function refreshRecordingStatus(sn = getRecordingCameraSn(), quiet = false) {
+    if (!sn) {
+        stopRecordingPolling();
+        renderRecordingStatus({ state: 'idle' });
+        return;
+    }
+    if (recordingPollSn && recordingPollSn !== sn) {
+        stopRecordingPolling();
+    }
+    try {
+        const response = await fetch(buildApiUrl(`/api/recordings/status?sn=${encodeURIComponent(sn)}`), {
+            cache: 'no-store'
+        });
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok || result.error) {
+            throw new Error(result.error || `HTTP ${response.status}`);
+        }
+        if (getRecordingCameraSn() !== sn) {
+            return;
+        }
+        renderRecordingStatus(result.recording || { sn, state: 'idle' });
+    } catch (error) {
+        stopRecordingPolling();
+        if (!quiet) {
+            log(`查询录像状态失败: ${error.message}`, 'error');
+        }
+    }
+}
+
+async function startRecording() {
+    const sn = getRecordingCameraSn();
+    if (!sn) {
+        log('请先选择或输入摄像机 SN', 'error');
+        return;
+    }
+    const durationInput = document.getElementById('recording-segment-seconds');
+    const segmentSeconds = Number(durationInput.value);
+    if (!Number.isInteger(segmentSeconds) || segmentSeconds < 10 || segmentSeconds > 86400) {
+        log('分片时长必须是 10-86400 之间的整数秒', 'error');
+        durationInput.focus();
+        return;
+    }
+    const configId = currentConfigId !== null ? currentConfigId : 0;
+    const recordingDir = document.getElementById('recording-output-root').value.trim();
+    if (!recordingDir) {
+        log('请设置录像文件保存路径', 'error');
+        document.getElementById('recording-output-root').focus();
+        return;
+    }
+    localStorage.setItem('cameraDecryptorSelectedSn', sn);
+    localStorage.setItem('cameraDecryptorRecordingDir', recordingDir);
+    const actionButton = document.getElementById('recording-action-button');
+    actionButton.disabled = true;
+    actionButton.textContent = '启动中...';
+    try {
+        const response = await fetch(buildApiUrl('/api/recordings/start'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sn, config_id: configId, segment_seconds: segmentSeconds, recording_dir: recordingDir })
+        });
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok || result.error) {
+            if (result.recording) {
+                renderRecordingStatus(result.recording);
+            }
+            throw new Error(result.error || `HTTP ${response.status}`);
+        }
+        renderRecordingStatus(result.recording);
+        log(`录像已启动: sn=${sn}, config=${configId}, segment=${segmentSeconds}s`, 'success');
+    } catch (error) {
+        log(`启动录像失败: ${error.message}`, 'error');
+        await refreshRecordingStatus(sn, true);
+    }
+}
+
+function toggleRecording() {
+    if (recordingActiveState === 'recording' || document.getElementById('recording-action-button').dataset.mode === 'stop') {
+        stopRecording();
+    } else {
+        startRecording();
+    }
+}
+
+async function stopRecording() {
+    const sn = getRecordingCameraSn();
+    if (!sn) {
+        return;
+    }
+    document.getElementById('recording-action-button').disabled = true;
+    document.getElementById('recording-action-button').textContent = '停止中...';
+    document.getElementById('recording-state-badge').textContent = '停止中';
+    try {
+        const response = await fetch(buildApiUrl(`/api/recordings/${encodeURIComponent(sn)}/stop`), {
+            method: 'POST'
+        });
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok || result.error) {
+            throw new Error(result.error || `HTTP ${response.status}`);
+        }
+        renderRecordingStatus(result.recording || { sn, state: 'idle' });
+        log(result.stopped ? '录像已停止' : '当前摄像机没有活动录像', 'success');
+    } catch (error) {
+        log(`停止录像失败: ${error.message}`, 'error');
+        refreshRecordingStatus(sn, true);
+    }
 }
 
 async function fetchGo2rtcConfig(explicitSn = '') {
@@ -342,6 +605,7 @@ function updateCurrentConfig(config) {
         item.classList.remove('active-config');
     });
     document.getElementById(`config-${config.id}`).classList.add('active-config');
+    updateRecordingConfigDisplay(config.id);
 }
 
 // ==================== 停止当前播放器 ====================
@@ -627,6 +891,7 @@ function stopAllTests() {
     stopCurrentPlayer();
     stopBackendDecryptedStream();
     currentConfigId = null;
+    updateRecordingConfigDisplay(0);
     updateStatus('已停止');
     document.querySelectorAll('.config-item').forEach(item => {
         item.classList.remove('active-config');
@@ -651,6 +916,15 @@ document.addEventListener('DOMContentLoaded', function() {
     }, 1000);
 
     loadCameraList();
+    loadRecordingSettings();
+
+    document.getElementById('camera-sn-input').addEventListener('change', function() {
+        const sn = this.value.trim();
+        if (sn) {
+            localStorage.setItem('cameraDecryptorSelectedSn', sn);
+        }
+        refreshRecordingStatus(sn);
+    });
 
     log('');
     updateStatus('等待输入');

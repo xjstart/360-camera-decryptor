@@ -21,7 +21,49 @@
 - `GET /api/go2rtc/stream/<sn>`
 - `GET /api/go2rtc/config?sn=...`
 - `GET /api/decrypted-stream/<sn>`
+- `POST /api/recordings/start`
+- `GET /api/recordings/settings`
+- `GET /api/recordings/status?sn=...`
+- `POST /api/recordings/<sn>/stop`
 - `POST /api/play-info/sync`
+
+## MP4 分片录像
+
+开始录像：
+
+```bash
+curl -X POST "http://127.0.0.1:5000/api/recordings/start" \
+  -H "Content-Type: application/json" \
+  -d '{"sn":"3601Q0700624502","config_id":0,"segment_seconds":1800,"recording_dir":"F:\\homemonitor\\360home"}'
+```
+
+`segment_seconds` 默认 `1800`（30 分钟），允许范围为 `10-86400`。`recording_dir` 可覆盖服务端默认保存根目录。同一摄像机已有活动录像时返回 HTTP `409`，不同摄像机可以并行录制。
+
+录像会按服务端本地日期创建目录，文件名形如：
+
+```text
+<recording_dir>/2026-08-22/manual-2026-08-22_16-46-39-d715ae70.mp4
+```
+
+查询默认设置：
+
+```bash
+curl "http://127.0.0.1:5000/api/recordings/settings"
+```
+
+查询状态：
+
+```bash
+curl "http://127.0.0.1:5000/api/recordings/status?sn=3601Q0700624502"
+```
+
+停止录像：
+
+```bash
+curl -X POST "http://127.0.0.1:5000/api/recordings/3601Q0700624502/stop"
+```
+
+停止接口是幂等的。状态可能是 `idle`、`recording`、`stopping`、`stopped` 或 `failed`。录像默认保存在 `backend/data/recordings`，可通过 `server.recording_dir` 修改。
 
 ## go2rtc 接入
 

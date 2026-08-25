@@ -562,6 +562,65 @@
             background: linear-gradient(180deg, rgba(255, 255, 255, 0.72), rgba(249, 244, 235, 0.92));
         }
 
+        .recording-section {
+            margin-top: 24px;
+            padding: 28px;
+        }
+
+        .recording-toolbar {
+            display: grid;
+            grid-template-columns: minmax(220px, 1fr) minmax(180px, 0.7fr) auto;
+            align-items: end;
+            gap: 18px;
+            margin-bottom: 20px;
+        }
+
+        .recording-duration-field {
+            margin-bottom: 0;
+        }
+
+        .recording-duration-field .input-label,
+        .recording-path-field .input-label {
+            color: var(--muted);
+        }
+
+        .recording-path-field {
+            grid-column: 1 / -1;
+            margin-bottom: 0;
+        }
+
+        .recording-config-summary {
+            min-height: 48px;
+            padding: 10px 14px;
+            border-radius: 14px;
+            background: rgba(15, 118, 110, 0.08);
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            gap: 4px;
+        }
+
+        .recording-buttons {
+            flex-wrap: nowrap;
+        }
+
+        .recording-buttons button {
+            min-width: 112px;
+        }
+
+        .recording-buttons .recording-stop-button {
+            color: white;
+            background: linear-gradient(135deg, #b42318, #d92d20);
+            box-shadow: 0 10px 20px rgba(180, 35, 24, 0.24);
+        }
+
+        .recording-status-grid {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 14px;
+            margin-bottom: 16px;
+        }
+
         .backend-player-toolbar {
             display: flex;
             align-items: center;
@@ -711,6 +770,18 @@
             .input-summary {
                 grid-template-columns: repeat(2, minmax(0, 1fr));
             }
+
+            .recording-toolbar {
+                grid-template-columns: 1fr 1fr;
+            }
+
+            .recording-buttons {
+                grid-column: 1 / -1;
+            }
+
+            .recording-status-grid {
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+            }
         }
 
         @media (max-width: 760px) {
@@ -727,6 +798,7 @@
             .input-section,
             .video-stream-section,
             .config-section,
+            .recording-section,
             .player-section,
             .log-section {
                 padding: 20px;
@@ -737,6 +809,16 @@
             .info-grid,
             .config-grid {
                 grid-template-columns: 1fr;
+            }
+
+            .recording-toolbar,
+            .recording-status-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .recording-buttons {
+                grid-column: auto;
+                flex-wrap: wrap;
             }
 
             #video-container {
