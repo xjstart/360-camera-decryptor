@@ -665,7 +665,11 @@ async function stopBackendDecryptedStream() {
         if (!response.ok || result.error) {
             throw new Error(result.error || '停止后端解密流失败');
         }
-        log(result.closed ? '后端解密流进程已停止' : '后端没有正在运行的解密流', 'success');
+        if (result.source_kept_alive) {
+            log('播放器已停止，公共解密流由录像继续占用', 'success');
+        } else {
+            log(result.closed ? '后端解密流进程已停止' : '后端没有正在运行的解密流', 'success');
+        }
     } catch (error) {
         log(`停止后端解密流失败: ${error.message}`, 'error');
     } finally {
@@ -699,12 +703,6 @@ async function testBackendDecryptedStream(refresh = false) {
 
     backendStreamConfigId = configId;
     backendStreamSn = sn;
-    if (!window.MediaSource) {
-        updateBackendPlayerStatus('浏览器不支持 MSE');
-        log('当前浏览器不支持 MediaSource，无法直接测试后端 fMP4 解密流', 'error');
-        return;
-    }
-
     const streamUrl = buildBackendDecryptedStreamUrl(configId, sn, refresh);
     updateBackendPlayerStatus(refresh ? '刷新启动中...' : '启动中...');
     log(`启动后端解密流: config=${configId}, sn=${sn}, refresh=${refresh ? '1' : '0'}`, 'info');
@@ -722,88 +720,23 @@ async function testBackendDecryptedStream(refresh = false) {
         log('后端解密流播放失败，请查看后端日志中的 Node/ffmpeg 输出', 'error');
     };
 
-    startBackendMsePlayback(video, streamUrl);
+    startBackendFmp4Playback(video, streamUrl);
 }
 
-function appendBufferAsync(sourceBuffer, chunk) {
-    return new Promise((resolve, reject) => {
-        const cleanup = () => {
-            sourceBuffer.removeEventListener('updateend', onUpdateEnd);
-            sourceBuffer.removeEventListener('error', onError);
-        };
-        const onUpdateEnd = () => {
-            cleanup();
-            resolve();
-        };
-        const onError = () => {
-            cleanup();
-            reject(new Error('SourceBuffer 写入失败'));
-        };
-        sourceBuffer.addEventListener('updateend', onUpdateEnd, { once: true });
-        sourceBuffer.addEventListener('error', onError, { once: true });
-        sourceBuffer.appendBuffer(chunk);
-    });
-}
-
-function startBackendMsePlayback(video, streamUrl) {
-    const mediaSource = new MediaSource();
-    backendStreamObjectUrl = URL.createObjectURL(mediaSource);
-    backendStreamAbortController = new AbortController();
-    video.src = backendStreamObjectUrl;
+function startBackendFmp4Playback(video, streamUrl) {
+    // 让浏览器原生 MP4 demuxer 处理 HTTP 分块与 moof/mdat 边界。手工把 fetch
+    // 返回的任意网络块逐个 append 到 SourceBuffer，会在真实流首个分片处触发
+    // SourceBuffer error，并可能让后端 remux 在断开后继续残留。
+    backendStreamAbortController = null;
+    backendStreamObjectUrl = '';
+    video.crossOrigin = 'anonymous';
+    video.src = streamUrl;
     video.load();
-
-    mediaSource.addEventListener('sourceopen', async () => {
-        let sourceBuffer = null;
-        try {
-            sourceBuffer = mediaSource.addSourceBuffer('video/mp4; codecs="avc1.42E01E, mp4a.40.2"');
-        } catch (error) {
-            updateBackendPlayerStatus('编码不支持');
-            log(`浏览器不支持当前 fMP4 编码: ${error.message}`, 'error');
-            return;
-        }
-
-        try {
-            const response = await fetch(streamUrl, {
-                cache: 'no-store',
-                signal: backendStreamAbortController.signal
-            });
-            if (!response.ok || !response.body) {
-                throw new Error(`HTTP ${response.status}`);
-            }
-
-            updateBackendPlayerStatus('接收数据中...');
-            const reader = response.body.getReader();
-            while (true) {
-                const { done, value } = await reader.read();
-                if (done) {
-                    break;
-                }
-                if (value && value.byteLength > 0) {
-                    await appendBufferAsync(sourceBuffer, value);
-                    if (video.paused) {
-                        video.play().catch((error) => {
-                            updateBackendPlayerStatus('等待手动播放');
-                            log(`后端解密流已接收数据，但浏览器阻止自动播放: ${error.message}`, 'warning');
-                        });
-                    }
-                }
-            }
-        } catch (error) {
-            if (error.name === 'AbortError') {
-                return;
-            }
-            updateBackendPlayerStatus('播放失败');
-            log(`后端解密流读取失败: ${error.message}`, 'error');
-        } finally {
-            if (mediaSource.readyState === 'open') {
-                try {
-                    mediaSource.endOfStream();
-                } catch (error) {
-                    console.warn('结束 MediaSource 失败:', error);
-                }
-            }
-        }
-    }, { once: true });
+    updateBackendPlayerStatus('接收数据中...');
+    video.play().catch((error) => {
+        updateBackendPlayerStatus('等待手动播放');
+        log(`后端解密流等待手动播放: ${error.message}`, 'warning');
+    });
 }
 
 // ==================== 测试配置 ====================

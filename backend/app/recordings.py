@@ -10,6 +10,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from queue import Queue
 from threading import Event, Lock, Thread
 from typing import Any, Optional
 
@@ -41,6 +42,10 @@ class RecordingTask:
     output_root: Path
     file_glob: str
     proc: subprocess.Popen[Any]
+    pipeline_mode: str = "independent"
+    source_session: Optional[Any] = None
+    source_subscriber_id: Optional[int] = None
+    source_queue: Optional[Queue[Optional[bytes]]] = None
     state: str = "recording"
     started_at: str = field(default_factory=utc_now_text)
     stopped_at: Optional[str] = None
@@ -73,8 +78,15 @@ class RecordingManager:
         segment_seconds: int,
         output_root: Path,
         cmd_factory: Any,
+        pipeline_mode: str = "independent",
+        source_session: Optional[Any] = None,
+        max_pending_input_bytes: int = 16 * 1024 * 1024,
     ) -> dict[str, Any]:
         """创建目录并启动录像；cmd_factory 接收输出文件模式。"""
+        if pipeline_mode not in {"shared", "independent"}:
+            raise ValueError(f"不支持的录像管线模式: {pipeline_mode}")
+        if pipeline_mode == "shared" and source_session is None:
+            raise ValueError("共享录像模式缺少解密流会话")
         with self._lock:
             current = self._tasks.get(sn)
             if current and current.state in ACTIVE_STATES and current.proc.poll() is None:
@@ -105,11 +117,32 @@ class RecordingManager:
                 output_root=output_root,
                 file_glob=file_glob,
                 proc=proc,
+                pipeline_mode=pipeline_mode,
+                source_session=source_session,
             )
+            if pipeline_mode == "shared":
+                def on_source_drop(reason: str) -> None:
+                    with self._lock:
+                        if not task.stop_requested and task.error is None:
+                            task.error = f"录像输入缓存溢出: {reason}"
+
+                try:
+                    subscriber_id, source_queue = source_session.subscribe(
+                        kind="recording",
+                        max_pending_bytes=max_pending_input_bytes,
+                        on_drop=on_source_drop,
+                    )
+                except Exception:
+                    terminate_process_tree(proc, f"recording[{sn}]", logger=self._log_warning)
+                    raise
+                task.source_subscriber_id = subscriber_id
+                task.source_queue = source_queue
             self._tasks[sn] = task
 
         Thread(target=self._drain_stderr, args=(task,), daemon=True).start()
         Thread(target=self._monitor, args=(task,), daemon=True).start()
+        if pipeline_mode == "shared":
+            Thread(target=self._feed_shared_stream, args=(task,), daemon=True).start()
         Thread(target=self._maintain_date_directories, args=(task,), daemon=True).start()
         if self._logger:
             self._logger.info("recording[%s] started id=%s segment=%ss", sn, recording_id, segment_seconds)
@@ -134,7 +167,11 @@ class RecordingManager:
 
         graceful = False
         try:
-            if task.proc.stdin and task.proc.stdin.writable():
+            if task.pipeline_mode == "shared":
+                if task.source_session is not None and task.source_subscriber_id is not None:
+                    task.source_session.unsubscribe(task.source_subscriber_id, preserve_pending=True)
+                    task.source_subscriber_id = None
+            elif task.proc.stdin and task.proc.stdin.writable():
                 task.proc.stdin.write(b"stop\n")
                 task.proc.stdin.flush()
             task.proc.wait(timeout=self._stop_timeout)
@@ -163,12 +200,45 @@ class RecordingManager:
 
     def _monitor(self, task: RecordingTask) -> None:
         return_code = task.proc.wait()
+        if task.source_session is not None and task.source_subscriber_id is not None:
+            task.source_session.unsubscribe(task.source_subscriber_id)
+            task.source_subscriber_id = None
         if task.proc.stdin:
             try:
                 task.proc.stdin.close()
             except OSError:
                 pass
         self._finalize(task, return_code)
+
+    def _feed_shared_stream(self, task: RecordingTask) -> None:
+        """把公共 MPEG-TS 送入录像 remux；结束订阅即向 ffmpeg 发送 EOF。"""
+        try:
+            if task.source_queue is None or task.proc.stdin is None:
+                return
+            while True:
+                chunk = task.source_queue.get()
+                if chunk is None:
+                    if not task.stop_requested:
+                        with self._lock:
+                            if task.error is None:
+                                task.error = "公共解密流已结束"
+                    break
+                task.proc.stdin.write(chunk)
+                task.proc.stdin.flush()
+        except (BrokenPipeError, OSError) as exc:
+            if not task.stop_requested:
+                with self._lock:
+                    if task.error is None:
+                        task.error = f"录像 remux 输入失败: {exc}"
+        finally:
+            if task.source_session is not None and task.source_subscriber_id is not None:
+                task.source_session.unsubscribe(task.source_subscriber_id)
+                task.source_subscriber_id = None
+            if task.proc.stdin:
+                try:
+                    task.proc.stdin.close()
+                except OSError:
+                    pass
 
     def _drain_stderr(self, task: RecordingTask) -> None:
         if not task.proc.stderr:
@@ -196,6 +266,8 @@ class RecordingManager:
             task.stop_event.set()
             if task.stop_requested:
                 task.state = "stopped"
+            elif task.error:
+                task.state = "failed"
             elif return_code == 0:
                 task.state = "stopped"
             else:
@@ -213,6 +285,7 @@ class RecordingManager:
             "recording_id": task.recording_id,
             "state": task.state,
             "config_id": task.config_id,
+            "pipeline_mode": task.pipeline_mode,
             "segment_seconds": task.segment_seconds,
             "started_at": task.started_at,
             "stopped_at": task.stopped_at,

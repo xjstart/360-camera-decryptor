@@ -181,7 +181,10 @@ class FfmpegTsMuxer {
           "-f",
           "mp4",
           ]
-        : ["-f", "mpegts"];
+        : ["-mpegts_flags", "+resend_headers", "-f", "mpegts"];
+    const x264Params = normalizedOutputFormat === "mpegts"
+      ? "rc-lookahead=0:sync-lookahead=0:repeat-headers=1"
+      : "rc-lookahead=0:sync-lookahead=0";
     const ffmpegArgs = [
       "-loglevel",
       "error",
@@ -214,7 +217,7 @@ class FfmpegTsMuxer {
       "-tune",
       "zerolatency",
       "-x264-params",
-      "rc-lookahead=0:sync-lookahead=0",
+      x264Params,
       "-g",
       String(Math.max(1, fps * 2)),
       "-keyint_min",

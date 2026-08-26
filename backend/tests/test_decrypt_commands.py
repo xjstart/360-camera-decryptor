@@ -12,7 +12,12 @@ BACKEND_DIR = Path(__file__).resolve().parents[1]
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from app.decrypt_commands import build_decrypt_command
+from app.decrypt_commands import (
+    build_decrypt_command,
+    build_playback_remux_command,
+    build_recording_remux_command,
+    build_shared_decrypt_command,
+)
 from app.paths import ConfigError
 from app.service import CameraBackendService
 
@@ -27,6 +32,31 @@ OPTIONS = {
 
 
 class DecryptCommandTests(unittest.TestCase):
+    def test_builds_shared_mpegts_source_command(self) -> None:
+        command = build_shared_decrypt_command(
+            config_id=0,
+            payload={"flashUrl": "https://example.test/live", "playKey": "secret"},
+            decrypt_options=OPTIONS,
+        )
+        self.assertEqual(command[command.index("--output-format") + 1], "mpegts")
+        self.assertNotIn("--output", command)
+        self.assertNotIn("--segment-seconds", command)
+
+    def test_builds_copy_only_playback_and_recording_remux_commands(self) -> None:
+        playback = build_playback_remux_command()
+        self.assertEqual(playback[playback.index("-c") + 1], "copy")
+        self.assertIn("aac_adtstoasc", playback)
+        self.assertIn("frag_keyframe+empty_moov+default_base_moof+omit_tfhd_offset", playback)
+        self.assertEqual(playback[-1], "pipe:1")
+
+        output = Path("recordings/%Y-%m-%d/manual-%Y-%m-%d_%H-%M-%S-abcd1234.mp4")
+        recording = build_recording_remux_command(output_path=output, segment_seconds=300)
+        self.assertEqual(recording[recording.index("-c") + 1], "copy")
+        self.assertIn("aac_adtstoasc", recording)
+        self.assertEqual(recording[recording.index("-segment_time") + 1], "300")
+        self.assertIn("-strftime", recording)
+        self.assertEqual(recording[-1], str(output))
+
     def test_builds_segmented_mp4_recording_command(self) -> None:
         output = Path("recordings/%Y-%m-%d/manual-%Y-%m-%d_%H-%M-%S-abcd1234.mp4")
         command = build_decrypt_command(
@@ -88,6 +118,23 @@ class DecryptCommandTests(unittest.TestCase):
                 actual = service.get_recording_dir(str(expected))
             self.assertEqual(actual, Path(os.path.abspath(expected)))
             self.assertTrue(expected.is_dir())
+
+    def test_shared_pipeline_config_defaults_and_override(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config_path = root / "config.yaml"
+            config_path.write_text("server: {}\n", encoding="utf-8")
+            service = CameraBackendService(str(config_path))
+            self.assertTrue(service.share_decrypt_session_between_playback_and_recording())
+            self.assertEqual(service.get_decrypt_stream_options()["recording_max_pending_input_bytes"], 16777216)
+
+            config_path.write_text(
+                "server:\n  share_decrypt_session_between_playback_and_recording: false\n"
+                "  recording_max_pending_input_bytes: 1048576\n",
+                encoding="utf-8",
+            )
+            self.assertFalse(service.share_decrypt_session_between_playback_and_recording())
+            self.assertEqual(service.get_decrypt_stream_options()["recording_max_pending_input_bytes"], 1048576)
 
 
 if __name__ == "__main__":

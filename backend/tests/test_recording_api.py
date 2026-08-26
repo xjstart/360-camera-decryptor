@@ -33,6 +33,7 @@ class FakeRecordingManager:
             "recording_id": "test-id",
             "state": "recording",
             "config_id": kwargs["config_id"],
+            "pipeline_mode": kwargs.get("pipeline_mode", "independent"),
             "segment_seconds": kwargs["segment_seconds"],
             "started_at": "2026-01-01T00:00:00Z",
             "stopped_at": None,
@@ -60,6 +61,16 @@ class FakeRecordingManager:
         return True, dict(self.status_value)
 
 
+class FakeDecryptSessionManager:
+    def __init__(self) -> None:
+        self.calls = []
+        self.session = object()
+
+    def get_or_create(self, **kwargs):
+        self.calls.append(kwargs)
+        return self.session
+
+
 class RecordingApiTests(unittest.TestCase):
     def setUp(self) -> None:
         app.config.update(TESTING=True)
@@ -77,6 +88,7 @@ class RecordingApiTests(unittest.TestCase):
             patch("app.service.service.find_camera", return_value={"sn": "camera-1", "enabled": True}),
             patch("app.service.get_decrypt_payload", return_value=self.payload),
             patch("app.service.service.get_recording_dir", return_value=Path(self.temp_dir.name)),
+            patch("app.service.service.share_decrypt_session_between_playback_and_recording", return_value=False),
         ]
         for item in self.patches:
             item.start()
@@ -160,6 +172,32 @@ class RecordingApiTests(unittest.TestCase):
         response = self.client.get("/api/recordings/settings")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["default_segment_seconds"], 1800)
+
+    def test_shared_recording_reuses_decrypt_source(self) -> None:
+        fake_sessions = FakeDecryptSessionManager()
+        with (
+            patch(
+                "app.service.service.share_decrypt_session_between_playback_and_recording",
+                return_value=True,
+            ),
+            patch("app.service.decrypt_session_manager", fake_sessions),
+        ):
+            response = self.client.post(
+                "/api/recordings/start",
+                json={"sn": "camera-1", "config_id": 0, "segment_seconds": 300},
+            )
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.get_json()["recording"]["pipeline_mode"], "shared")
+        self.assertEqual(len(fake_sessions.calls), 1)
+        command = fake_sessions.calls[0]["cmd"]
+        self.assertEqual(command[command.index("--output-format") + 1], "mpegts")
+
+    def test_playback_stop_reports_recording_kept_source(self) -> None:
+        result = {"closed": True, "closed_consumers": 1, "source_kept_alive": True}
+        with patch("app.service.decrypt_session_manager.close_playback_group", return_value=result):
+            response = self.client.post("/api/decrypted-stream/0/camera-1/stop")
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()["source_kept_alive"])
 
 
 if __name__ == "__main__":

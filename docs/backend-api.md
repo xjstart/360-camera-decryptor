@@ -20,7 +20,8 @@
 - `GET /api/stream/<sn>`
 - `GET /api/go2rtc/stream/<sn>`
 - `GET /api/go2rtc/config?sn=...`
-- `GET /api/decrypted-stream/<sn>`
+- `GET /api/decrypted-stream/<config_id>/<sn>`
+- `POST /api/decrypted-stream/<config_id>/<sn>/stop`
 - `POST /api/recordings/start`
 - `GET /api/recordings/settings`
 - `GET /api/recordings/status?sn=...`
@@ -63,7 +64,17 @@ curl "http://127.0.0.1:5000/api/recordings/status?sn=3601Q0700624502"
 curl -X POST "http://127.0.0.1:5000/api/recordings/3601Q0700624502/stop"
 ```
 
-停止接口是幂等的。状态可能是 `idle`、`recording`、`stopping`、`stopped` 或 `failed`。录像默认保存在 `backend/data/recordings`，可通过 `server.recording_dir` 修改。
+停止接口是幂等的。状态可能是 `idle`、`recording`、`stopping`、`stopped` 或 `failed`，并通过 `pipeline_mode` 表明当前使用 `shared` 或 `independent` 管线。录像默认保存在 `backend/data/recordings`，可通过 `server.recording_dir` 修改。
+
+默认情况下，播放和录像会共用一套拉流、WASM 解密及 H.264/AAC 编码主干，再分别无重编码封装为 fMP4 或 MP4 分片。可通过以下配置控制共享和录像输入缓存：
+
+```yaml
+server:
+  share_decrypt_session_between_playback_and_recording: true
+  recording_max_pending_input_bytes: 16777216
+```
+
+设为 `false` 后，录像恢复为独立 Node/WASM/ffmpeg 进程。播放停止接口只关闭播放消费者；存在录像租约时响应包含 `source_kept_alive: true`。
 
 ## go2rtc 接入
 
@@ -92,7 +103,7 @@ curl "http://127.0.0.1:5000/api/go2rtc/config?sn=3601Q0700624502&mode=decrypted&
 说明：
 
 - `/api/go2rtc/stream/<sn>` 是 `/api/stream/<sn>` 的语义化别名，方便在 `go2rtc.yaml` 中引用。
-- `/api/decrypted-stream/<sn>` 会启动 Node + wasm 解密器，把加密 FLV 直接解码后再转成 MPEG-TS 输出。
+- `/api/decrypted-stream/<config_id>/<sn>` 会启动或复用 Node + wasm 解密主干；默认输出 MPEG-TS，`format=mp4` 时无重编码封装为前端 MSE 使用的 fMP4。
 - 当前 `MPEG-TS` 输出已包含视频和音频，样本验证结果为 `H.264 + AAC`。
 - `/api/go2rtc/config` 默认返回 JSON，其中包含 `yaml` 字段和每个摄像机对应的 `go2rtc_source`，支持 `mode=raw` 和 `mode=decrypted`。
 - 当前服务端解密方案本质上是“把播放器使用的 wasm 解密核心搬到 Node 后端”，还不是纯 Python/Go 重写版算法。

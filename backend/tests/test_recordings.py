@@ -6,6 +6,7 @@ import time
 import unittest
 from datetime import datetime
 from pathlib import Path
+from queue import Queue
 from unittest.mock import patch
 
 
@@ -28,6 +29,30 @@ for line in sys.stdin:
     if line.strip() == 'stop':
         raise SystemExit(0)
 """
+
+READ_SHARED_STREAM_SCRIPT = r"""
+from datetime import datetime
+import pathlib
+import sys
+
+output = pathlib.Path(datetime.now().astimezone().strftime(sys.argv[1]))
+output.parent.mkdir(parents=True, exist_ok=True)
+data = sys.stdin.buffer.read()
+output.write_bytes(data or b'empty')
+"""
+
+
+class FakeSourceSession:
+    def __init__(self) -> None:
+        self.queue: Queue[bytes | None] = Queue()
+        self.subscriber_id = 0
+
+    def subscribe(self, **_kwargs):
+        self.subscriber_id += 1
+        return self.subscriber_id, self.queue
+
+    def unsubscribe(self, _subscriber_id: int, **_kwargs) -> None:
+        self.queue.put(None)
 
 
 class RecordingManagerTests(unittest.TestCase):
@@ -144,6 +169,53 @@ class RecordingManagerTests(unittest.TestCase):
             terminate.assert_called_once()
         finally:
             manager.close_all()
+
+    def test_shared_pipeline_feeds_remux_and_stops_with_eof(self) -> None:
+        source = FakeSourceSession()
+
+        def shared_factory(output_pattern: Path) -> list[str]:
+            return [sys.executable, "-u", "-c", READ_SHARED_STREAM_SCRIPT, str(output_pattern)]
+
+        started = self.manager.start(
+            sn="camera-shared",
+            config_id=0,
+            segment_seconds=10,
+            output_root=self.root,
+            cmd_factory=shared_factory,
+            pipeline_mode="shared",
+            source_session=source,
+        )
+        self.assertEqual(started["pipeline_mode"], "shared")
+        source.queue.put(b"shared-mpegts")
+        stopped, status = self.manager.stop("camera-shared")
+        self.assertTrue(stopped)
+        self.assertEqual(status["state"], "stopped")
+        output = next(self.root.glob("*/manual-*.mp4"))
+        self.assertEqual(output.read_bytes(), b"shared-mpegts")
+
+    def test_shared_source_ending_marks_recording_failed(self) -> None:
+        source = FakeSourceSession()
+
+        def shared_factory(output_pattern: Path) -> list[str]:
+            return [sys.executable, "-u", "-c", READ_SHARED_STREAM_SCRIPT, str(output_pattern)]
+
+        self.manager.start(
+            sn="camera-source-failed",
+            config_id=0,
+            segment_seconds=10,
+            output_root=self.root,
+            cmd_factory=shared_factory,
+            pipeline_mode="shared",
+            source_session=source,
+        )
+        source.queue.put(None)
+        deadline = time.monotonic() + 2
+        status = self.manager.status("camera-source-failed")
+        while status["state"] == "recording" and time.monotonic() < deadline:
+            time.sleep(0.02)
+            status = self.manager.status("camera-source-failed")
+        self.assertEqual(status["state"], "failed")
+        self.assertIn("公共解密流已结束", status["error"])
 
 
 if __name__ == "__main__":

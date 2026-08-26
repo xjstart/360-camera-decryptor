@@ -40,9 +40,11 @@ server:
   decrypt_max_pending_video_bytes: 6291456
   decrypt_max_pending_audio_bytes: 524288
   decrypt_ffmpeg_threads: 1
+  share_decrypt_session_between_playback_and_recording: true
+  recording_max_pending_input_bytes: 16777216
 ```
 
-这几个值会直接限制 Node 输入缓存、Node 到 `ffmpeg` 的待写入队列，以及 `ffmpeg` 编码线程数。机器内存比较紧时，优先把 `decrypt_ffmpeg_threads` 固定为 `1`，再继续下调 `decrypt_max_pending_video_bytes`。
+前五个值限制 Node 输入缓存、Node 到 `ffmpeg` 的待写入队列及编码线程数。共享开关默认开启：同一摄像机、解密配置、帧率和播放凭证下，播放与录像只执行一次拉流、WASM 解密和 H.264/AAC 编码，再分别无重编码封装为前端 fMP4 和录像 MP4 分片。`recording_max_pending_input_bytes` 限制录像 remux 的 TS 输入缓存；持续跟不上时只会让该录像失败，不阻塞播放器。需要回退旧行为时可将共享开关设为 `false`。
 
 ## 接入 go2rtc
 
@@ -74,13 +76,15 @@ streams:
 - 页面可以直接设置录像保存根目录；留空配置时默认使用 `backend/data/recordings`
 - 文件按日期保存，例如 `F:\homemonitor\360home\2026-08-22\manual-2026-08-22_16-46-39-d715ae70.mp4`
 - 每个分片包含 H.264 视频和 AAC 音频；切片发生在关键帧处，实际时长可能比设置值略长
-- 录像使用独立解密进程，网页播放器停止或刷新不会中断录像
+- 默认与播放器共用解密和编码主干；停止或刷新播放器不会中断录像，公共主干故障则会同时影响两者
 
 可以在 `backend/data/config.yaml` 中修改录像根目录：
 
 ```yaml
 server:
   recording_dir: ""
+  share_decrypt_session_between_playback_and_recording: true
+  recording_max_pending_input_bytes: 16777216
 ```
 
 留空时使用 `backend/data/recordings`，页面填写的保存路径会覆盖这项默认配置并保存在当前浏览器中。Docker Compose 已把默认目录挂载到宿主机相同位置；容器部署时页面应填写容器内可写路径。

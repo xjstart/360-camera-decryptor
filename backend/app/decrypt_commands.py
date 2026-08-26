@@ -82,3 +82,92 @@ def build_decrypt_command(
     if control_stdin:
         cmd.append("--control-stdin")
     return cmd
+
+
+def build_shared_decrypt_command(
+    *,
+    config_id: int,
+    payload: Mapping[str, Any],
+    decrypt_options: Mapping[str, int],
+    fps: str = "12",
+) -> list[str]:
+    """构造可被播放和录像共同订阅的 MPEG-TS 解密/编码主干。"""
+    return build_decrypt_command(
+        config_id=config_id,
+        payload=payload,
+        decrypt_options=decrypt_options,
+        fps=fps,
+        output_format="mpegts",
+    )
+
+
+def build_playback_remux_command() -> list[str]:
+    """把公共 MPEG-TS 无重编码封装成浏览器 MSE 使用的 fMP4。"""
+    return [
+        "ffmpeg",
+        "-loglevel",
+        "error",
+        "-fflags",
+        "+genpts",
+        "-i",
+        "pipe:0",
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a?",
+        "-c",
+        "copy",
+        "-bsf:a",
+        "aac_adtstoasc",
+        "-avoid_negative_ts",
+        "make_zero",
+        "-movflags",
+        "frag_keyframe+empty_moov+default_base_moof+omit_tfhd_offset",
+        "-frag_duration",
+        "1000000",
+        "-f",
+        "mp4",
+        "pipe:1",
+    ]
+
+
+def build_recording_remux_command(
+    *,
+    output_path: Path,
+    segment_seconds: int,
+    segment_strftime: bool = True,
+) -> list[str]:
+    """把公共 MPEG-TS 无重编码保存成独立 MP4 分片。"""
+    cmd = [
+        "ffmpeg",
+        "-loglevel",
+        "error",
+        "-fflags",
+        "+genpts",
+        "-i",
+        "pipe:0",
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a?",
+        "-c",
+        "copy",
+        "-bsf:a",
+        "aac_adtstoasc",
+        "-f",
+        "segment",
+        "-segment_time",
+        str(segment_seconds),
+        "-reset_timestamps",
+        "1",
+        "-segment_start_number",
+        "1",
+        "-segment_format",
+        "mp4",
+        "-segment_format_options",
+        "movflags=+faststart",
+    ]
+    if segment_strftime:
+        cmd.extend(["-strftime", "1"])
+    cmd.append(str(output_path))
+    return cmd

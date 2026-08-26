@@ -11,6 +11,8 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
+import uuid
+from dataclasses import dataclass
 from queue import Empty, Full, Queue
 from threading import Lock, Thread, Timer
 from pathlib import Path
@@ -18,6 +20,14 @@ from typing import Any, Callable, Optional
 
 
 LoggerCallable = Callable[[str, tuple[Any, ...]], None]
+DropCallable = Callable[[str], None]
+
+
+@dataclass
+class SubscriberState:
+    queue: Queue[Optional[bytes]]
+    kind: str
+    on_drop: Optional[DropCallable] = None
 
 
 def terminate_process_tree(
@@ -110,17 +120,31 @@ class SharedDecryptSession:
         self.logger = logger
         self.idle_timeout_seconds = max(1, idle_timeout_seconds)
         self._lock = Lock()
-        self._subscribers: dict[int, Queue[Optional[bytes]]] = {}
+        self._subscribers: dict[int, SubscriberState] = {}
         self._next_subscriber_id = 0
         self._idle_timer: Optional[Timer] = None
         self._closed = False
         self._return_code: Optional[int] = None
+        self._idle_timer = Timer(self.idle_timeout_seconds, self._terminate_if_idle)
+        self._idle_timer.daemon = True
+        self._idle_timer.start()
         Thread(target=self._log_stderr, daemon=True).start()
         Thread(target=self._fanout_stdout, daemon=True).start()
 
-    def subscribe(self) -> tuple[int, Queue[Optional[bytes]]]:
-        """注册一个浏览器/客户端订阅者，并返回它自己的输出队列。"""
-        queue: Queue[Optional[bytes]] = Queue(maxsize=8)
+    def subscribe(
+        self,
+        *,
+        kind: str = "playback",
+        max_pending_bytes: Optional[int] = None,
+        on_drop: Optional[DropCallable] = None,
+    ) -> tuple[int, Queue[Optional[bytes]]]:
+        """注册播放或录像消费者，并返回独立的有界输出队列。"""
+        if kind not in {"playback", "recording"}:
+            raise ValueError(f"unsupported decrypt subscriber kind: {kind}")
+        queue_chunks = 8
+        if max_pending_bytes is not None:
+            queue_chunks = max(1, (max_pending_bytes + 64 * 1024 - 1) // (64 * 1024))
+        queue: Queue[Optional[bytes]] = Queue(maxsize=queue_chunks)
         with self._lock:
             if self._closed:
                 raise RuntimeError("decrypt session already closed")
@@ -129,16 +153,16 @@ class SharedDecryptSession:
                 self._idle_timer = None
             self._next_subscriber_id += 1
             subscriber_id = self._next_subscriber_id
-            self._subscribers[subscriber_id] = queue
+            self._subscribers[subscriber_id] = SubscriberState(queue=queue, kind=kind, on_drop=on_drop)
         return subscriber_id, queue
 
-    def unsubscribe(self, subscriber_id: int) -> None:
+    def unsubscribe(self, subscriber_id: int, *, preserve_pending: bool = False) -> None:
         """注销订阅者；无人观看后延迟停止进程，给播放器短暂重连留余地。"""
         should_schedule_idle = False
         with self._lock:
-            queue = self._subscribers.pop(subscriber_id, None)
-            if queue is not None:
-                self._signal_queue_end(queue)
+            subscriber = self._subscribers.pop(subscriber_id, None)
+            if subscriber is not None:
+                self._signal_queue_end(subscriber.queue, preserve_pending=preserve_pending)
             should_schedule_idle = not self._closed and not self._subscribers and self.proc.poll() is None
             if should_schedule_idle and self._idle_timer is None:
                 self._idle_timer = Timer(self.idle_timeout_seconds, self._terminate_if_idle)
@@ -150,6 +174,22 @@ class SharedDecryptSession:
                 self.label,
                 self.idle_timeout_seconds,
             )
+
+    def has_consumers(self, kind: Optional[str] = None) -> bool:
+        with self._lock:
+            return any(kind is None or subscriber.kind == kind for subscriber in self._subscribers.values())
+
+    def close_consumers(self, kind: str) -> int:
+        """关闭指定类型的消费者，但保留仍被其他类型使用的公共源。"""
+        with self._lock:
+            subscriber_ids = [
+                subscriber_id
+                for subscriber_id, subscriber in self._subscribers.items()
+                if subscriber.kind == kind
+            ]
+        for subscriber_id in subscriber_ids:
+            self.unsubscribe(subscriber_id)
+        return len(subscriber_ids)
 
     def close(self, reason: str = "closed") -> Optional[int]:
         """主动关闭会话，用于失败重试、服务退出或替换同组旧流。"""
@@ -200,17 +240,28 @@ class SharedDecryptSession:
                 self.logger.warning("%s exited with code %s", self.label, return_code)
 
     def _publish_chunk(self, chunk: bytes) -> None:
-        stale_subscribers: list[int] = []
+        stale_subscribers: list[tuple[int, SubscriberState]] = []
         with self._lock:
             items = list(self._subscribers.items())
-        for subscriber_id, queue in items:
+        for subscriber_id, subscriber in items:
             try:
-                queue.put_nowait(chunk)
+                subscriber.queue.put_nowait(chunk)
             except Full:
-                stale_subscribers.append(subscriber_id)
-        for subscriber_id in stale_subscribers:
+                stale_subscribers.append((subscriber_id, subscriber))
+        for subscriber_id, subscriber in stale_subscribers:
             if self.logger:
-                self.logger.warning("%s subscriber=%s is too slow, dropping it", self.label, subscriber_id)
+                self.logger.warning(
+                    "%s subscriber=%s kind=%s is too slow, dropping it",
+                    self.label,
+                    subscriber_id,
+                    subscriber.kind,
+                )
+            if subscriber.on_drop:
+                try:
+                    subscriber.on_drop(f"{subscriber.kind} consumer exceeded its pending input limit")
+                except Exception as exc:
+                    if self.logger:
+                        self.logger.warning("%s subscriber=%s drop callback failed: %s", self.label, subscriber_id, exc)
             self.unsubscribe(subscriber_id)
 
     def _terminate_if_idle(self) -> None:
@@ -218,9 +269,14 @@ class SharedDecryptSession:
             self._idle_timer = None
             if self._closed or self._subscribers or self.proc.poll() is not None:
                 return
+            # 在释放锁前阻止新订阅，避免“刚判定为空闲就有消费者加入”的竞态。
+            self._closed = True
         if self.logger:
             self.logger.info("%s idle timeout reached, stopping decrypt process", self.label)
-        self.close("idle timeout")
+        return_code = terminate_process_tree(self.proc, self.label, logger=self._log_warning)
+        with self._lock:
+            if return_code is not None and self._return_code is None:
+                self._return_code = return_code
 
     def _close_locked(self, return_code: Optional[int]) -> None:
         if self._closed:
@@ -234,22 +290,31 @@ class SharedDecryptSession:
             self._idle_timer = None
         subscribers = list(self._subscribers.values())
         self._subscribers.clear()
-        for queue in subscribers:
-            self._signal_queue_end(queue)
+        for subscriber in subscribers:
+            self._signal_queue_end(
+                subscriber.queue,
+                preserve_pending=subscriber.kind == "recording",
+            )
 
     @staticmethod
-    def _signal_queue_end(queue: Queue[Optional[bytes]]) -> None:
-        try:
-            queue.put_nowait(None)
-        except Full:
+    def _signal_queue_end(queue: Queue[Optional[bytes]], *, preserve_pending: bool = False) -> None:
+        if preserve_pending:
+            try:
+                queue.put(None, timeout=1)
+                return
+            except Full:
+                pass
+        # 不能把结束标记塞到满队列时，不保留后续数据；清掉整个待写尾部，避免
+        # “丢一块旧数据但继续写新数据”造成流中间断裂。
+        while True:
             try:
                 queue.get_nowait()
             except Empty:
-                pass
-            try:
-                queue.put_nowait(None)
-            except Full:
-                pass
+                break
+        try:
+            queue.put_nowait(None)
+        except Full:
+            pass
 
 
 class SharedDecryptSessionManager:
@@ -282,20 +347,45 @@ class SharedDecryptSessionManager:
         with self._lock:
             self._drop_dead_sessions_locked()
 
-            session = self._sessions.get(key)
-            if session and not session.is_closed() and session.proc.poll() is None and not replace_group:
-                return session
-            if session and replace_group:
-                session.close("replaced by an explicit retry")
-                self._sessions.pop(key, None)
-                if self._group_index.get(group_key) == key:
-                    self._group_index.pop(group_key, None)
+            active_id = self._group_index.get(group_key)
+            active_session = self._sessions.get(active_id or "")
+            if (
+                active_session
+                and active_session.key == key
+                and not active_session.is_closed()
+                and active_session.proc.poll() is None
+                and not replace_group
+            ):
+                return active_session
 
-            old_key = self._group_index.get(group_key)
-            old_session = self._sessions.get(old_key or "")
-            if replace_group and old_session and old_key != key:
-                old_session.close("replaced by a fresh stream")
-                self._sessions.pop(old_key or "", None)
+            if not replace_group:
+                matching_item = next(
+                    (
+                        (session_id, session)
+                        for session_id, session in self._sessions.items()
+                        if session.group_key == group_key
+                        and session.key == key
+                        and not session.is_closed()
+                        and session.proc.poll() is None
+                    ),
+                    None,
+                )
+                if matching_item is not None:
+                    matching_id, matching_session = matching_item
+                    if active_session is None:
+                        self._group_index[group_key] = matching_id
+                    return matching_session
+
+            if replace_group and active_session:
+                if active_session.has_consumers("recording"):
+                    if self._logger:
+                        self._logger.info(
+                            "%s keeps the old decrypt generation alive for recording",
+                            active_session.label,
+                        )
+                else:
+                    active_session.close("replaced by an explicit retry")
+                    self._sessions.pop(active_id or "", None)
                 self._group_index.pop(group_key, None)
 
             proc = subprocess.Popen(
@@ -313,15 +403,45 @@ class SharedDecryptSessionManager:
                 idle_timeout_seconds,
                 logger=self._logger,
             )
-            self._sessions[key] = session
-            self._group_index[group_key] = key
+            session_id = uuid.uuid4().hex
+            self._sessions[session_id] = session
+            self._group_index[group_key] = session_id
             return session
+
+    def close_playback_group(self, group_key: str, reason: str = "playback stopped by request") -> dict[str, Any]:
+        """关闭组内全部播放消费者；录像租约存在时保留公共解密源。"""
+        with self._lock:
+            items = [
+                (session_id, session)
+                for session_id, session in self._sessions.items()
+                if session.group_key == group_key
+            ]
+
+        closed_consumers = 0
+        source_kept_alive = False
+        closed_sources = 0
+        for session_id, session in items:
+            closed_consumers += session.close_consumers("playback")
+            if session.has_consumers("recording"):
+                source_kept_alive = True
+                continue
+            session.close(reason)
+            closed_sources += 1
+            with self._lock:
+                self._sessions.pop(session_id, None)
+                if self._group_index.get(group_key) == session_id:
+                    self._group_index.pop(group_key, None)
+        return {
+            "closed": bool(closed_consumers or closed_sources),
+            "closed_consumers": closed_consumers,
+            "source_kept_alive": source_kept_alive,
+        }
 
     def close_group(self, group_key: str, reason: str = "closed by request") -> bool:
         """按摄像机/配置关闭会话，供前端停止按钮显式调用。"""
         with self._lock:
-            key = self._group_index.pop(group_key, None)
-            session = self._sessions.pop(key or "", None)
+            session_id = self._group_index.pop(group_key, None)
+            session = self._sessions.pop(session_id or "", None)
         if not session:
             return False
         session.close(reason)
@@ -338,8 +458,8 @@ class SharedDecryptSessionManager:
         return len(sessions)
 
     def _drop_dead_sessions_locked(self) -> None:
-        for key, session in list(self._sessions.items()):
+        for session_id, session in list(self._sessions.items()):
             if session.is_closed() or session.proc.poll() is not None:
-                self._sessions.pop(key, None)
-                if self._group_index.get(session.group_key) == key:
+                self._sessions.pop(session_id, None)
+                if self._group_index.get(session.group_key) == session_id:
                     self._group_index.pop(session.group_key, None)

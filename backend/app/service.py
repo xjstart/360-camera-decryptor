@@ -10,8 +10,9 @@ import re
 import time
 import json
 import shutil
+import subprocess
 from pathlib import Path
-from threading import Lock
+from threading import Lock, Thread
 from typing import Any, Dict, Optional
 
 import requests
@@ -20,10 +21,17 @@ from flask import Flask, Response, jsonify, request, send_from_directory, stream
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 from .api_client import CameraAPIRequest
-from .decrypt_commands import SUPPORTED_CONFIG_IDS, build_decrypt_command
+from .decrypt_commands import (
+    SUPPORTED_CONFIG_IDS,
+    SUPPORTED_OUTPUT_FORMATS,
+    build_decrypt_command,
+    build_playback_remux_command,
+    build_recording_remux_command,
+    build_shared_decrypt_command,
+)
 from .paths import BACKEND_DIR, ROOT_DIR, WEB_DIR, ConfigError
 from .recordings import RecordingConflict, RecordingManager
-from .stream_sessions import SharedDecryptSessionManager
+from .stream_sessions import SharedDecryptSessionManager, terminate_process_tree
 
 
 class CameraBackendService:
@@ -112,6 +120,7 @@ class CameraBackendService:
             "decrypt_max_pending_audio_bytes": 1024 * 1024,
             "decrypt_ffmpeg_threads": 1,
             "decrypt_idle_timeout_seconds": 10,
+            "recording_max_pending_input_bytes": 16 * 1024 * 1024,
         }
         options: Dict[str, int] = {}
         for key, default in defaults.items():
@@ -121,6 +130,17 @@ class CameraBackendService:
             except (TypeError, ValueError):
                 options[key] = default
         return options
+
+    def share_decrypt_session_between_playback_and_recording(self) -> bool:
+        raw_value = self.load_config().get("server", {}).get(
+            "share_decrypt_session_between_playback_and_recording",
+            True,
+        )
+        if raw_value is None:
+            return True
+        if isinstance(raw_value, str):
+            return raw_value.strip().lower() not in {"0", "false", "no", "off"}
+        return bool(raw_value)
 
     def list_cameras(self) -> list[Dict[str, Any]]:
         """返回前端展示所需的摄像机列表，不暴露 Cookie 等敏感配置。"""
@@ -466,6 +486,7 @@ app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1, x_port=1)
 decrypt_session_manager = SharedDecryptSessionManager(logger=app.logger, cwd=ROOT_DIR)
 recording_manager = RecordingManager(logger=app.logger, cwd=ROOT_DIR)
+atexit.register(decrypt_session_manager.close_all)
 atexit.register(recording_manager.close_all)
 
 
@@ -494,6 +515,23 @@ def build_go2rtc_response(sn: Optional[str] = None, mode: str = "raw", config_id
 def build_decrypt_group_key(config_id: int, sn: str) -> str:
     """同一摄像机和同一解密配置共用一个进程组标识。"""
     return json.dumps({"config_id": config_id, "sn": sn}, sort_keys=True, ensure_ascii=True)
+
+
+def build_decrypt_source_key(config_id: int, sn: str, fps: str, payload: Dict[str, Any], *, shared: bool) -> str:
+    """公共源身份不包含最终封装格式；独立模式仍区分自己的输出代次。"""
+    return json.dumps(
+        {
+            "pipeline": "shared" if shared else "independent",
+            "config_id": config_id,
+            "sn": sn,
+            "fps": fps,
+            "flash_url": payload.get("flashUrl") or "",
+            "play_key": payload.get("playKey") or "",
+            "relay_sig": (payload.get("relaySig") or "") if config_id == 3 else "",
+        },
+        sort_keys=True,
+        ensure_ascii=True,
+    )
 
 
 def get_decrypt_payload(sn: str, *, force_refresh: bool = False) -> Dict[str, Any]:
@@ -644,6 +682,7 @@ def go2rtc_stream(sn: str) -> Response:
 
 @app.route("/api/decrypted-stream/<config_id>/<sn>")
 def decrypted_stream(config_id: str, sn: str) -> Response:
+    remux_proc: Optional[subprocess.Popen[Any]] = None
     try:
         config_id_int = int(config_id)
         force_refresh = request.args.get("refresh") == "1"
@@ -653,30 +692,36 @@ def decrypted_stream(config_id: str, sn: str) -> Response:
         payload = get_decrypt_payload(sn, force_refresh=force_refresh)
         fps = (request.args.get("fps") or "12").strip()
         output_format = (request.args.get("format") or "mpegts").strip().lower()
+        if output_format not in SUPPORTED_OUTPUT_FORMATS:
+            raise ConfigError("format 仅支持 mpegts 或 mp4")
         decrypt_options = service.get_decrypt_stream_options()
-        cmd = build_decrypt_command(
-            config_id=config_id_int,
-            payload=payload,
-            decrypt_options=decrypt_options,
-            fps=fps,
-            output_format=output_format,
-        )
-
-        session_key = json.dumps(
-            {
-                "config_id": config_id_int,
-                "sn": sn,
-                "fps": fps,
-                "output_format": output_format,
-                "flash_url": payload.get("flashUrl") or "",
-                "play_key": payload.get("playKey") or "",
-                "relay_sig": (payload.get("relaySig") or "") if config_id_int == 3 else "",
-            },
-            sort_keys=True,
-            ensure_ascii=True,
-        )
+        shared_pipeline = service.share_decrypt_session_between_playback_and_recording()
+        if shared_pipeline:
+            cmd = build_shared_decrypt_command(
+                config_id=config_id_int,
+                payload=payload,
+                decrypt_options=decrypt_options,
+                fps=fps,
+            )
+            session_key = build_decrypt_source_key(config_id_int, sn, fps, payload, shared=True)
+        else:
+            cmd = build_decrypt_command(
+                config_id=config_id_int,
+                payload=payload,
+                decrypt_options=decrypt_options,
+                fps=fps,
+                output_format=output_format,
+            )
+            session_key = json.dumps(
+                {
+                    "source": build_decrypt_source_key(config_id_int, sn, fps, payload, shared=False),
+                    "output_format": output_format,
+                },
+                sort_keys=True,
+                ensure_ascii=True,
+            )
         group_key = build_decrypt_group_key(config_id_int, sn)
-        label = f"decrypted-stream[{config_id_int}/{sn}]"
+        label = f"decrypt-source[{config_id_int}/{sn}]" if shared_pipeline else f"decrypted-stream[{config_id_int}/{sn}]"
         session = decrypt_session_manager.get_or_create(
             key=session_key,
             group_key=group_key,
@@ -685,25 +730,85 @@ def decrypted_stream(config_id: str, sn: str) -> Response:
             cmd=cmd,
             replace_group=replace_group,
         )
-        subscriber_id, subscriber_queue = session.subscribe()
+        subscriber_id, subscriber_queue = session.subscribe(kind="playback")
+        if shared_pipeline and output_format == "mp4":
+            try:
+                remux_proc = subprocess.Popen(
+                    build_playback_remux_command(),
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    cwd=os.fspath(ROOT_DIR),
+                    start_new_session=True,
+                )
+            except Exception:
+                session.unsubscribe(subscriber_id)
+                raise
     except ConfigError as exc:
         return jsonify({"error": str(exc)}), 400
     except ValueError:
         return jsonify({"error": "config_id 必须是整数"}), 400
     except OSError as exc:
-        return jsonify({"error": f"启动 Node 解密器失败: {exc}"}), 500
+        return jsonify({"error": f"启动解密或封装进程失败: {exc}"}), 500
     except RuntimeError as exc:
         return jsonify({"error": f"解密流会话不可用: {exc}"}), 503
 
+    if remux_proc is not None:
+        def feed_remux_input() -> None:
+            try:
+                assert remux_proc is not None and remux_proc.stdin is not None
+                while True:
+                    chunk = subscriber_queue.get()
+                    if chunk is None:
+                        break
+                    remux_proc.stdin.write(chunk)
+                    remux_proc.stdin.flush()
+            except (BrokenPipeError, OSError) as exc:
+                app.logger.warning("playback-remux[%s/%s] input failed: %s", config_id_int, sn, exc)
+            finally:
+                if remux_proc is not None and remux_proc.stdin is not None:
+                    try:
+                        remux_proc.stdin.close()
+                    except OSError:
+                        pass
+
+        def log_remux_stderr() -> None:
+            assert remux_proc is not None
+            if remux_proc.stderr is None:
+                return
+            try:
+                for raw_line in iter(remux_proc.stderr.readline, b""):
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if line:
+                        app.logger.warning("playback-remux[%s/%s]: %s", config_id_int, sn, line)
+            finally:
+                remux_proc.stderr.close()
+
+        Thread(target=feed_remux_input, daemon=True).start()
+        Thread(target=log_remux_stderr, daemon=True).start()
+
     def generate():
         try:
-            while True:
-                chunk = subscriber_queue.get()
-                if chunk is None:
-                    break
-                yield chunk
+            if remux_proc is not None:
+                assert remux_proc.stdout is not None
+                while chunk := remux_proc.stdout.read(64 * 1024):
+                    yield chunk
+            else:
+                while True:
+                    chunk = subscriber_queue.get()
+                    if chunk is None:
+                        break
+                    yield chunk
         finally:
             session.unsubscribe(subscriber_id)
+            if remux_proc is not None:
+                if remux_proc.stdout is not None:
+                    remux_proc.stdout.close()
+                terminate_process_tree(
+                    remux_proc,
+                    f"playback-remux[{config_id_int}/{sn}]",
+                    logger=lambda message, args: app.logger.warning(message, *args),
+                )
             return_code = session.return_code()
             if return_code not in (0, None):
                 app.logger.warning("decrypted-stream[%s/%s] exited with code %s", config_id_int, sn, return_code)
@@ -743,19 +848,48 @@ def start_recording() -> Response:
             raise RecordingConflict(f"摄像机 {sn} 已在录制")
         payload = get_decrypt_payload(sn)
         decrypt_options = service.get_decrypt_stream_options()
-
-        def cmd_factory(output_pattern: Path) -> list[str]:
-            return build_decrypt_command(
-                config_id=config_id,
-                payload=payload,
-                decrypt_options=decrypt_options,
-                fps="12",
-                output_format="mp4",
-                output_path=output_pattern,
-                segment_seconds=segment_seconds,
-                segment_strftime=True,
-                control_stdin=True,
+        shared_pipeline = service.share_decrypt_session_between_playback_and_recording()
+        start_options: Dict[str, Any] = {}
+        if shared_pipeline:
+            fps = "12"
+            source_session = decrypt_session_manager.get_or_create(
+                key=build_decrypt_source_key(config_id, sn, fps, payload, shared=True),
+                group_key=build_decrypt_group_key(config_id, sn),
+                label=f"decrypt-source[{config_id}/{sn}]",
+                idle_timeout_seconds=decrypt_options["decrypt_idle_timeout_seconds"],
+                cmd=build_shared_decrypt_command(
+                    config_id=config_id,
+                    payload=payload,
+                    decrypt_options=decrypt_options,
+                    fps=fps,
+                ),
             )
+
+            def cmd_factory(output_pattern: Path) -> list[str]:
+                return build_recording_remux_command(
+                    output_path=output_pattern,
+                    segment_seconds=segment_seconds,
+                    segment_strftime=True,
+                )
+
+            start_options = {
+                "pipeline_mode": "shared",
+                "source_session": source_session,
+                "max_pending_input_bytes": decrypt_options["recording_max_pending_input_bytes"],
+            }
+        else:
+            def cmd_factory(output_pattern: Path) -> list[str]:
+                return build_decrypt_command(
+                    config_id=config_id,
+                    payload=payload,
+                    decrypt_options=decrypt_options,
+                    fps="12",
+                    output_format="mp4",
+                    output_path=output_pattern,
+                    segment_seconds=segment_seconds,
+                    segment_strftime=True,
+                    control_stdin=True,
+                )
 
         status = recording_manager.start(
             sn=sn,
@@ -763,11 +897,14 @@ def start_recording() -> Response:
             segment_seconds=segment_seconds,
             output_root=service.get_recording_dir(raw_recording_dir),
             cmd_factory=cmd_factory,
+            **start_options,
         )
     except RecordingConflict as exc:
         return jsonify({"error": str(exc), "recording": recording_manager.status(sn)}), 409
     except ConfigError as exc:
         return jsonify({"error": str(exc)}), 400
+    except RuntimeError as exc:
+        return jsonify({"error": f"共享解密流会话不可用: {exc}"}), 503
     except (OSError, ValueError) as exc:
         return jsonify({"error": f"录像保存路径或进程不可用: {exc}"}), 500
     return jsonify({"ok": True, "recording": status}), 201
@@ -810,11 +947,11 @@ def stop_decrypted_stream(config_id: str, sn: str) -> Response:
     except ValueError:
         return jsonify({"error": "config_id 必须是整数"}), 400
 
-    closed = decrypt_session_manager.close_group(
+    result = decrypt_session_manager.close_playback_group(
         build_decrypt_group_key(config_id_int, sn),
         reason="stopped by frontend",
     )
-    return jsonify({"ok": True, "closed": closed})
+    return jsonify({"ok": True, **result})
 
 
 @app.route("/")

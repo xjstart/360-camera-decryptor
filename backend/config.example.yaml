@@ -33,6 +33,10 @@ server:
   play_info_cache_dir: ""
   # MP4 录像分片默认保存目录；留空时使用 backend/data/recordings，网页可为当前录像覆盖
   recording_dir: ""
+  # 播放与录像共用一套拉流、WASM 解密和 H.264/AAC 编码主干
+  share_decrypt_session_between_playback_and_recording: true
+  # 共享模式下录像等待写入 ffmpeg 的 MPEG-TS 缓存上限
+  recording_max_pending_input_bytes: 16777216
   # 部署在反向代理后面时，显式指定前端可访问的后端公网地址
   # 例如: "https://you.domain.com"
   public_base_url: ""
