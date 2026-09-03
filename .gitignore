@@ -15,4 +15,6 @@ save_web/
 .venv/
 backend/.cache/
 backend/libffmpeg.wasm
+backend/data/config.yaml
+backend/data/play_info_cache/
 backend/data/recordings/

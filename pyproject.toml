@@ -1,0 +1,15 @@
+[project]
+name = "360-camera-decryptor"
+version = "0.1.0"
+description = "360 智能摄像机视频流获取与解密工具"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "flask>=3.0.0",
+    "pyyaml>=6.0",
+    "requests>=2.31.0",
+]
+
+[tool.uv]
+package = false
+link-mode = "copy"

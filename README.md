@@ -11,24 +11,32 @@
 
 ## 快速开始
 
-```bash
-cd backend
-pip install -r requirements.txt
-mkdir -p data
-python server.py
+本地需安装 `uv`、Node.js 和 FFmpeg。Python 及 Python 包由 `uv` 自动管理：
+
+```powershell
+uv sync
+uv run python backend/server.py
 ```
 
 打开 `http://127.0.0.1:5000/` 即可使用前端页面。
 
-首次启动时，如果 `data/config.yaml` 不存在，后端会自动用 `backend/config.example.yaml` 复制生成一份。
+首次启动时，如果 `backend/data/config.yaml` 不存在，后端会自动用 `backend/config.example.yaml` 复制生成一份。
 
-`data/config.yaml` 里只需要填写浏览器 Cookie 中的 `Q`、`T`、`jia_web_sid` 三个值，按 `cookie` 列表格式配置即可。
+`backend/data/config.yaml` 不会被 Git 跟踪。请填写浏览器 Cookie 中的 `Q`、`T`、`jia_web_sid` 三个值，并把摄像机条目的 `sn` 改成真实序列号。
 
 常用命令：
 
 ```bash
-cd backend
-python server.py
+uv run python backend/server.py
+```
+
+验证环境和运行测试：
+
+```powershell
+uv run python --version
+node --version
+ffmpeg -version
+uv run python -m unittest discover -s backend/tests
 ```
 
 如果你在用 Python 拉 Node.js 解密流，并且 `ffmpeg` 转码时出现内存持续上涨，可以先从 `backend/data/config.yaml` 的 `server` 段调小这几个参数：
