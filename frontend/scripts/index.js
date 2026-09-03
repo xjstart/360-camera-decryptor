@@ -764,6 +764,9 @@ function testConfig(configId) {
     const container = document.getElementById('video-container');
 
     try {
+        // 这一轮保持使用后端代理流，避免把 CDN 跨域差异混入低延迟参数测试。
+        // 后端返回的 flashUrl 是同源 /api/stream/<sn>，sourceFlashUrl 保留作后续
+        // “直连 CDN / 代理流”对照实验使用。
         const streamUrl = apiResponse.flashUrl || apiResponse.sourceFlashUrl;
 
         const playerConfig = {
@@ -775,16 +778,27 @@ function testConfig(configId) {
             autoplay: true,
             logLevel: 2,
             renderType: 'all',
-            resample: 0
+            // 与 360 官网 mylist.js 的直播低延迟配置保持一致。库默认需要先
+            // 累积 512 KiB 才打开解码器，低码率摄像机上会直接形成 10-30 秒延迟。
+            minDecoderBufferSize: 1,
+            waitingPcmDur: 50,
+            waitingYuvNum: 1,
+            delayTimeLimit: 1000,
+            resample: 1
         };
 
         if (config.keyForKey) {
             playerConfig.keyForKey = config.keyForKey;
         }
 
-        log(`播放器配置: ${JSON.stringify(playerConfig)}`, 'info');
+        // 不把播放密钥和带凭证的流地址写进页面日志。
+        log(
+            'QhwwPlayer 低延迟配置: minBuffer=1B, audioWait=50ms, videoWait=1frame, delayLimit=1000ms, resample=1',
+            'info'
+        );
 
         currentPlayer = new QhwwPlayer(playerConfig);
+        let lastTelemetryAt = 0;
 
         currentPlayer.on({
             ready: () => {
@@ -807,7 +821,28 @@ function testConfig(configId) {
                 log(`播放错误: ${error}`, 'error');
                 updateStatus('播放错误');
             },
-            timeupdate: () => {
+            timeupdate: (event) => {
+                const now = Date.now();
+                if (now - lastTelemetryAt < 5000) {
+                    return;
+                }
+                lastTelemetryAt = now;
+
+                const data = event && event.data ? event.data : {};
+                const decoderMs = Math.max(
+                    Number(data.pcmDecoderCacheDuration || 0),
+                    Number(data.yuvDecoderCacheDuration || 0)
+                );
+                const renderMs = Math.max(
+                    Number(data.pcmRenderCacheDuration || 0),
+                    Number(data.yuvRenderCacheDuration || 0)
+                );
+                if (decoderMs > 0 || renderMs > 0) {
+                    log(
+                        `QhwwPlayer 缓冲观测: decoder=${Math.round(decoderMs)}ms, render=${Math.round(renderMs)}ms`,
+                        decoderMs > 3000 ? 'warning' : 'info'
+                    );
+                }
             }
         });
 

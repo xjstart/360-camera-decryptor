@@ -659,7 +659,9 @@ def proxy_stream(sn: str) -> Response:
 
     def generate():
         try:
-            for chunk in upstream.iter_content(chunk_size=64 * 1024):
+            # QhwwPlayer 的低延迟模式需要尽快收到首批 FLV 数据。64 KiB 会在低
+            # 码率流上形成明显的按块等待；16 KiB 在调用开销和实时性之间更合适。
+            for chunk in upstream.iter_content(chunk_size=16 * 1024):
                 if chunk:
                     yield chunk
         finally:
