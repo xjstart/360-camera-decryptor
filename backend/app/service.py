@@ -115,6 +115,7 @@ class CameraBackendService:
         server_config = self.load_config().get("server", {})
         defaults = {
             "decrypt_network_chunk_size": 64 * 1024,
+            "decrypt_min_decoder_buffer_size": 1,
             "decrypt_max_pending_input_bytes": 512 * 1024,
             "decrypt_max_pending_video_bytes": 12 * 1024 * 1024,
             "decrypt_max_pending_audio_bytes": 1024 * 1024,
@@ -659,9 +660,8 @@ def proxy_stream(sn: str) -> Response:
 
     def generate():
         try:
-            # QhwwPlayer 的低延迟模式需要尽快收到首批 FLV 数据。64 KiB 会在低
-            # 码率流上形成明显的按块等待；16 KiB 在调用开销和实时性之间更合适。
-            for chunk in upstream.iter_content(chunk_size=16 * 1024):
+            # 4 KiB 在低码率流上减少代理端凑块等待。
+            for chunk in upstream.iter_content(chunk_size=4 * 1024):
                 if chunk:
                     yield chunk
         finally:
@@ -674,6 +674,7 @@ def proxy_stream(sn: str) -> Response:
     )
     if upstream.headers.get("Content-Length"):
         response.headers["Content-Length"] = upstream.headers["Content-Length"]
+    response.headers["X-Accel-Buffering"] = "no"
     return response
 
 
@@ -793,7 +794,7 @@ def decrypted_stream(config_id: str, sn: str) -> Response:
         try:
             if remux_proc is not None:
                 assert remux_proc.stdout is not None
-                while chunk := remux_proc.stdout.read(64 * 1024):
+                while chunk := remux_proc.stdout.read1(64 * 1024):
                     yield chunk
             else:
                 while True:
@@ -816,7 +817,9 @@ def decrypted_stream(config_id: str, sn: str) -> Response:
                 app.logger.warning("decrypted-stream[%s/%s] exited with code %s", config_id_int, sn, return_code)
 
     content_type = "video/mp4" if output_format == "mp4" else "video/mp2t"
-    return Response(stream_with_context(generate()), content_type=content_type)
+    response = Response(stream_with_context(generate()), content_type=content_type)
+    response.headers["X-Accel-Buffering"] = "no"
+    return response
 
 
 @app.route("/api/recordings/start", methods=["POST"])

@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import time
 import unittest
+from queue import Full
 from pathlib import Path
 
 
@@ -10,18 +11,27 @@ BACKEND_DIR = Path(__file__).resolve().parents[1]
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from app.stream_sessions import SharedDecryptSession, SharedDecryptSessionManager
+from app.stream_sessions import SharedDecryptSession, SharedDecryptSessionManager, SubscriberQueue
 
 
 KEEP_ALIVE_COMMAND = [
     sys.executable,
     "-u",
     "-c",
-    "import sys, time; sys.stdout.buffer.write(b'start'); sys.stdout.buffer.flush(); time.sleep(60)",
+    "import time; time.sleep(60)",
 ]
 
 
 class SharedDecryptSessionTests(unittest.TestCase):
+    def test_small_pipe_write_is_delivered_before_process_exit(self) -> None:
+        session = self.manager.get_or_create(
+            key="short-write", group_key="short-write", label="short-write", idle_timeout_seconds=2,
+            cmd=[sys.executable, "-u", "-c", "import time; time.sleep(.2); print('frame', flush=True); time.sleep(60)"],
+        )
+        _, queue = session.subscribe()
+        self.assertEqual(queue.get(timeout=2).strip(), b"frame")
+        self.assertIsNone(session.proc.poll())
+
     def setUp(self) -> None:
         self.manager = SharedDecryptSessionManager(cwd=BACKEND_DIR.parent)
 
@@ -95,7 +105,7 @@ class SharedDecryptSessionTests(unittest.TestCase):
 
     def test_slow_playback_is_dropped_without_stopping_recording(self) -> None:
         session = self.create_session()
-        playback_id, _ = session.subscribe(kind="playback", max_pending_bytes=1)
+        playback_id, _ = session.subscribe(kind="playback", max_pending_bytes=3)
         recording_id, recording_queue = session.subscribe(kind="recording", max_pending_bytes=1024 * 1024)
 
         session._publish_chunk(b"one")
@@ -127,13 +137,37 @@ class SharedDecryptSessionTests(unittest.TestCase):
         reasons: list[str] = []
         _subscriber_id, _queue = session.subscribe(
             kind="recording",
-            max_pending_bytes=1,
+            max_pending_bytes=3,
             on_drop=reasons.append,
         )
         session._publish_chunk(b"one")
         session._publish_chunk(b"two")
         self.assertFalse(session.has_consumers("recording"))
         self.assertEqual(reasons, ["recording consumer exceeded its pending input limit"])
+
+
+class SubscriberQueueTests(unittest.TestCase):
+    def test_limit_tracks_actual_bytes_and_recovers_after_read(self):
+        queue = SubscriberQueue(10)
+        for _ in range(10):
+            queue.put_nowait(b"x")
+        with self.assertRaises(Full):
+            queue.put_nowait(b"x")
+        self.assertEqual(queue.get_nowait(), b"x")
+        queue.put_nowait(b"y")
+        self.assertEqual(queue.pending_bytes, 10)
+
+    def test_recording_eof_preserves_full_queue_without_waiting(self):
+        queue = SubscriberQueue(3)
+        queue.put_nowait(b"abc")
+        started = time.monotonic()
+        queue.close(preserve_pending=True)
+        self.assertLess(time.monotonic() - started, .1)
+        with self.assertRaises(Full):
+            queue.put_nowait(b"later")
+        self.assertEqual(queue.get_nowait(), b"abc")
+        self.assertIsNone(queue.get_nowait())
+        self.assertEqual(queue.pending_bytes, 0)
 
 
 if __name__ == "__main__":

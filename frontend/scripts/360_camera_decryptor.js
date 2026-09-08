@@ -106,7 +106,12 @@ class CameraDecryptor {
             keyType: 0, // 解密方式
             isLive: true,
             autoplay: true,
-            logLevel: 1
+            logLevel: 0,
+            minDecoderBufferSize: 1,
+            waitingPcmDur: 50,
+            waitingYuvNum: 1,
+            delayTimeLimit: 1000,
+            resample: 1
         });
 
         return player;
@@ -133,16 +138,13 @@ class CameraDecryptor {
             return;
         }
 
-        console.log('播放信息:', playInfo);
 
         if (playInfo.isEncrypted) {
             console.log('视频流已加密，使用密钥解密');
-            console.log('密钥:', playInfo.playKey);
         } else {
             console.log('视频流未加密');
         }
 
-        console.log('视频流地址:', playInfo.videoUrl);
 
         // 创建播放器
         const player = this.createPlayer(playInfo.videoUrl, playInfo.playKey, container);

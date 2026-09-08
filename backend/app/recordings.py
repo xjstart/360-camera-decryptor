@@ -177,6 +177,8 @@ class RecordingManager:
             task.proc.wait(timeout=self._stop_timeout)
             graceful = True
         except (BrokenPipeError, OSError, subprocess.TimeoutExpired):
+            with self._lock:
+                task.error = task.error or "录像未能正常收尾，已强制停止；最后一个分片可能不完整"
             terminate_process_tree(task.proc, f"recording[{sn}]", logger=self._log_warning)
         finally:
             if task.proc.stdin:
@@ -264,9 +266,7 @@ class RecordingManager:
                 return
             task.stopped_at = utc_now_text()
             task.stop_event.set()
-            if task.stop_requested:
-                task.state = "stopped"
-            elif task.error:
+            if task.error:
                 task.state = "failed"
             elif return_code == 0:
                 task.state = "stopped"

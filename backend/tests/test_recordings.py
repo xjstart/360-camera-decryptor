@@ -165,7 +165,8 @@ class RecordingManagerTests(unittest.TestCase):
             with patch("app.recordings.terminate_process_tree", side_effect=kill_process) as terminate:
                 stopped, status = manager.stop("camera-timeout")
             self.assertTrue(stopped)
-            self.assertEqual(status["state"], "stopped")
+            self.assertEqual(status["state"], "failed")
+            self.assertIn("强制停止", status["error"])
             terminate.assert_called_once()
         finally:
             manager.close_all()

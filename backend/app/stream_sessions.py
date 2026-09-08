@@ -13,7 +13,7 @@ import signal
 import subprocess
 import uuid
 from dataclasses import dataclass
-from queue import Empty, Full, Queue
+from queue import Full, Queue
 from threading import Lock, Thread, Timer
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -23,9 +23,42 @@ LoggerCallable = Callable[[str, tuple[Any, ...]], None]
 DropCallable = Callable[[str], None]
 
 
+class SubscriberQueue(Queue[Optional[bytes]]):
+    """按实际字节限流；写入从不阻塞公共源，EOF 有独立位置。"""
+
+    def __init__(self, max_pending_bytes: int):
+        super().__init__()
+        self.max_pending_bytes = max(1, max_pending_bytes)
+        self.pending_bytes = 0
+        self.closed = False
+
+    def _put(self, item: Optional[bytes]) -> None:
+        if self.closed or (item is not None and self.pending_bytes + len(item) > self.max_pending_bytes):
+            raise Full
+        super()._put(item)
+        self.pending_bytes += len(item) if item is not None else 0
+
+    def _get(self) -> Optional[bytes]:
+        item = super()._get()
+        self.pending_bytes -= len(item) if item is not None else 0
+        return item
+
+    def close(self, *, preserve_pending: bool = False) -> None:
+        with self.mutex:
+            if self.closed:
+                return
+            self.closed = True
+            if not preserve_pending:
+                self.queue.clear()
+                self.pending_bytes = 0
+            # 不等待消费者腾位置，也不为塞入 EOF 而截掉录像尾部。
+            super()._put(None)
+            self.not_empty.notify_all()
+
+
 @dataclass
 class SubscriberState:
-    queue: Queue[Optional[bytes]]
+    queue: SubscriberQueue
     kind: str
     on_drop: Optional[DropCallable] = None
 
@@ -141,10 +174,7 @@ class SharedDecryptSession:
         """注册播放或录像消费者，并返回独立的有界输出队列。"""
         if kind not in {"playback", "recording"}:
             raise ValueError(f"unsupported decrypt subscriber kind: {kind}")
-        queue_chunks = 8
-        if max_pending_bytes is not None:
-            queue_chunks = max(1, (max_pending_bytes + 64 * 1024 - 1) // (64 * 1024))
-        queue: Queue[Optional[bytes]] = Queue(maxsize=queue_chunks)
+        queue = SubscriberQueue(max_pending_bytes if max_pending_bytes is not None else 512 * 1024)
         with self._lock:
             if self._closed:
                 raise RuntimeError("decrypt session already closed")
@@ -226,7 +256,8 @@ class SharedDecryptSession:
         try:
             assert self.proc.stdout is not None
             while True:
-                chunk = self.proc.stdout.read(64 * 1024)
+                # read1 返回当前管道可用数据，避免 read 等到凑满 64 KiB。
+                chunk = self.proc.stdout.read1(64 * 1024)
                 if not chunk:
                     break
                 self._publish_chunk(chunk)
@@ -297,24 +328,8 @@ class SharedDecryptSession:
             )
 
     @staticmethod
-    def _signal_queue_end(queue: Queue[Optional[bytes]], *, preserve_pending: bool = False) -> None:
-        if preserve_pending:
-            try:
-                queue.put(None, timeout=1)
-                return
-            except Full:
-                pass
-        # 不能把结束标记塞到满队列时，不保留后续数据；清掉整个待写尾部，避免
-        # “丢一块旧数据但继续写新数据”造成流中间断裂。
-        while True:
-            try:
-                queue.get_nowait()
-            except Empty:
-                break
-        try:
-            queue.put_nowait(None)
-        except Full:
-            pass
+    def _signal_queue_end(queue: SubscriberQueue, *, preserve_pending: bool = False) -> None:
+        queue.close(preserve_pending=preserve_pending)
 
 
 class SharedDecryptSessionManager:

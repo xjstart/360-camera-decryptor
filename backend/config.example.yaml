@@ -42,9 +42,11 @@ server:
   public_base_url: ""
   # Node 拉取上游流时的单次读取块大小；更小的值通常更省内存，但 CPU 开销会略高
   decrypt_network_chunk_size: 65536
+  # 尽早尝试打开解码器；碎片化流头会重建并重放启动数据，最多回退到 512 KiB
+  decrypt_min_decoder_buffer_size: 1
   # Node 侧待送入解码器的输入缓存上限，超过后会暂停继续拉取上游
   decrypt_max_pending_input_bytes: 524288
-  # Node -> ffmpeg 的视频待写入缓存上限，超过后会触发背压/丢帧保护
+  # Node -> ffmpeg 视频待写入上限；触发背压，单帧无法容纳时明确失败而非静默丢帧
   decrypt_max_pending_video_bytes: 12582912
   # Node -> ffmpeg 的音频待写入缓存上限
   decrypt_max_pending_audio_bytes: 1048576

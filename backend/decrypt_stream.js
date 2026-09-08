@@ -111,6 +111,54 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+class FlvInputBuffer {
+  constructor(maxTagBytes = 4 * 1024 * 1024) {
+    this.pending = Buffer.alloc(0);
+    this.headerRead = false;
+    this.maxTagBytes = maxTagBytes;
+    this.hasAudio = false;
+    this.hasVideo = false;
+    this.audioReady = false;
+    this.videoReady = false;
+  }
+
+  push(chunk) {
+    this.pending = Buffer.concat([this.pending, chunk]);
+    const packets = [];
+    if (!this.headerRead) {
+      if (this.pending.length < 9) return packets;
+      if (this.pending.toString("ascii", 0, 3) !== "FLV") throw new Error("上游不是 FLV 流");
+      const headerBytes = this.pending.readUInt32BE(5) + 4;
+      if (headerBytes < 13 || headerBytes > this.maxTagBytes) throw new Error("FLV 文件头长度无效");
+      if (this.pending.length < headerBytes) return packets;
+      this.hasAudio = Boolean(this.pending[4] & 4);
+      this.hasVideo = Boolean(this.pending[4] & 1);
+      packets.push(this.pending.subarray(0, headerBytes));
+      this.pending = this.pending.subarray(headerBytes);
+      this.headerRead = true;
+    }
+    while (this.pending.length >= 11) {
+      const size = this.pending.readUIntBE(1, 3);
+      const total = 11 + size + 4;
+      if (total > this.maxTagBytes) throw new Error("FLV tag 超过解码缓存上限");
+      if (this.pending.length < total) break;
+      const packet = this.pending.subarray(0, total);
+      if (packet.readUInt32BE(total - 4) !== total - 4) throw new Error("FLV tag 长度校验失败");
+      const type = packet[0] & 31;
+      if (type === 8 && size > 1) this.audioReady = true;
+      // AVC/HEVC sequence header 后仍需完整视频包，避免 open 成功但尺寸为 0。
+      if (type === 9 && size > 5 && packet[12] === 1) this.videoReady = true;
+      packets.push(packet);
+      this.pending = this.pending.subarray(total);
+    }
+    return packets;
+  }
+
+  ready() {
+    return this.headerRead && (!this.hasAudio || this.audioReady) && (!this.hasVideo || this.videoReady);
+  }
+}
+
 class FfmpegTsMuxer {
   constructor({
     fps,
@@ -137,6 +185,8 @@ class FfmpegTsMuxer {
           String(audioSampleRate),
           "-ac",
           String(audioChannels),
+          "-probesize", "32",
+          "-analyzeduration", "1",
           "-i",
           "pipe:3",
         ]
@@ -177,11 +227,11 @@ class FfmpegTsMuxer {
           "-movflags",
           "frag_keyframe+empty_moov+default_base_moof+omit_tfhd_offset",
           "-frag_duration",
-          "1000000",
+          "250000",
           "-f",
           "mp4",
           ]
-        : ["-mpegts_flags", "+resend_headers", "-f", "mpegts"];
+        : ["-mpegts_flags", "+resend_headers", "-muxdelay", "0", "-muxpreload", "0", "-f", "mpegts"];
     const x264Params = normalizedOutputFormat === "mpegts"
       ? "rc-lookahead=0:sync-lookahead=0:repeat-headers=1"
       : "rc-lookahead=0:sync-lookahead=0";
@@ -189,7 +239,7 @@ class FfmpegTsMuxer {
       "-loglevel",
       "error",
       "-fflags",
-      "+genpts+nobuffer",
+      "+genpts",
       "-flags",
       "low_delay",
       "-f",
@@ -200,6 +250,8 @@ class FfmpegTsMuxer {
       `${width}x${height}`,
       "-framerate",
       String(fps),
+      "-probesize", "32",
+      "-analyzeduration", "1",
       "-i",
       "pipe:0",
       ...audioInputArgs,
@@ -219,7 +271,7 @@ class FfmpegTsMuxer {
       "-x264-params",
       x264Params,
       "-g",
-      String(Math.max(1, fps * 2)),
+      String(Math.max(1, Math.round(fps))),
       "-keyint_min",
       String(Math.max(1, fps)),
       "-bf",
@@ -227,6 +279,8 @@ class FfmpegTsMuxer {
       ...audioOutputArgs,
       "-pix_fmt",
       "yuv420p",
+      "-flush_packets", "1",
+      "-max_interleave_delta", "100000",
       ...outputArgs,
       outputPath || "pipe:1",
     ];
@@ -243,10 +297,16 @@ class FfmpegTsMuxer {
     this.audioQueuedBytes = 0;
     this.maxPendingVideoBytes = Math.max(1024 * 1024, Number(maxPendingVideoBytes || 8 * 1024 * 1024));
     this.maxPendingAudioBytes = Math.max(256 * 1024, Number(maxPendingAudioBytes || 2 * 1024 * 1024));
+    this.videoFrameBytes = width * height * 3 / 2;
+    this.audioFrameBytes = 0;
     this.videoDraining = false;
     this.audioDraining = false;
     this.closed = false;
+    this.closing = false;
     this.lastError = null;
+    for (const input of [this.videoIn, this.audioIn].filter(Boolean)) {
+      input.on("error", (error) => { this.lastError = error; });
+    }
     this.exitPromise = new Promise((resolve) => {
       this.resolveExit = resolve;
     });
@@ -266,7 +326,7 @@ class FfmpegTsMuxer {
 
     this.process.once("error", (error) => onProcessExit(error));
     this.process.once("exit", (code, signal) => {
-      if (code === 0 || code === null) {
+      if (code === 0) {
         onProcessExit(null);
         return;
       }
@@ -281,8 +341,8 @@ class FfmpegTsMuxer {
 
   isBackpressured() {
     return (
-      this.videoQueuedBytes >= this.maxPendingVideoBytes ||
-      this.audioQueuedBytes >= this.maxPendingAudioBytes
+      (this.videoQueuedBytes > 0 && this.videoQueuedBytes + this.videoFrameBytes > this.maxPendingVideoBytes) ||
+      (this.audioQueuedBytes > 0 && this.audioQueuedBytes + this.audioFrameBytes > this.maxPendingAudioBytes)
     );
   }
 
@@ -291,6 +351,7 @@ class FfmpegTsMuxer {
   }
 
   enqueueAudio(frameBuffer) {
+    this.audioFrameBytes = Math.max(this.audioFrameBytes, frameBuffer.length);
     return this.enqueueFrame("audio", frameBuffer);
   }
 
@@ -298,7 +359,7 @@ class FfmpegTsMuxer {
     if (!frameBuffer || frameBuffer.length === 0) {
       return true;
     }
-    if (this.closed) {
+    if (this.closed || this.closing) {
       return false;
     }
 
@@ -360,22 +421,20 @@ class FfmpegTsMuxer {
         }
       }
       this[drainingKey] = false;
+      if (this.closing && !stream.writableEnded) stream.end();
     } catch (error) {
       fail(error);
     }
   }
 
   close() {
-    if (this.closed) {
+    if (this.closed || this.closing) {
       return;
     }
-    this.closed = true;
-    if (this.videoIn && this.videoIn.writable) {
-      this.videoIn.end();
-    }
-    if (this.audioIn && this.audioIn.writable) {
-      this.audioIn.end();
-    }
+    // EOF 必须排在所有已接受帧之后；write(false) 仅表示等待 drain，不能丢弃队列。
+    this.closing = true;
+    this.drainQueue("video");
+    if (this.audioIn) this.drainQueue("audio");
   }
 
   terminate(signalName = "SIGTERM") {
@@ -398,6 +457,36 @@ class FfmpegTsMuxer {
   }
 }
 
+class VideoFrameClock {
+  constructor(fps) {
+    if (!Number.isFinite(fps) || fps <= 0 || fps > 120) throw new Error("输出 fps 必须在 0-120 之间");
+    this.fps = fps;
+    this.origin = null;
+    this.nextFrame = 0;
+    this.previous = null;
+    this.lastTimestamp = null;
+  }
+
+  sample(frame, timestamp) {
+    if (!Number.isFinite(timestamp)) throw new Error("视频时间戳无效");
+    if (this.origin === null) this.origin = timestamp;
+    if (this.lastTimestamp !== null && (timestamp < this.lastTimestamp || timestamp - this.lastTimestamp > 2000)) {
+      throw new Error("视频时间戳不连续，停止录制以避免错误时间线");
+    }
+    const output = [];
+    // FLV 时间戳只有毫秒精度，允许 1 ms 量化误差，避免 83 ms 被错判为尚未到 1/12 秒。
+    const lastIndex = Math.floor((timestamp - this.origin + 1) * this.fps / 1000);
+    while (this.nextFrame <= lastIndex) {
+      const sampleTime = this.origin + this.nextFrame * 1000 / this.fps;
+      output.push(this.previous && sampleTime < timestamp - .001 ? this.previous : frame);
+      this.nextFrame += 1;
+    }
+    this.previous = frame;
+    this.lastTimestamp = timestamp;
+    return output;
+  }
+}
+
 class CameraWasmDecoder {
   constructor(module, options) {
     this.module = module;
@@ -410,13 +499,20 @@ class CameraWasmDecoder {
     this.opening = false;
     this.ended = false;
     this.videoFrames = 0;
+    this.lastProgressAt = Date.now();
     this.audioFrames = 0;
+    this.pendingInitialAudio = [];
+    this.pendingInitialAudioBytes = 0;
     this.ffmpegMuxer = null;
     this.keyType = Number(options.keyType || 0);
-    this.minBufferSize = Number(options.minBufferSize || 524288);
+    this.minBufferSize = Number(options.minBufferSize || 1);
+    this.nextOpenSize = this.minBufferSize;
+    this.startupChunks = [];
     this.decoderMemorySize = Number(options.decoderMemorySize || 5242880);
     this.chunkSize = Number(options.chunkSize || 524288);
     this.fps = Number(options.fps || 12);
+    this.videoClock = new VideoFrameClock(this.fps);
+    this.pendingVideoFrames = [];
     this.maxFrames = options.maxFrames ? Number(options.maxFrames) : 0;
     this.outputPath = options.outputPath || "";
     this.quiet = Boolean(options.quiet);
@@ -432,15 +528,18 @@ class CameraWasmDecoder {
     this.videoHeight = 0;
     this.droppedVideoFrames = 0;
     this.droppedAudioFrames = 0;
+    this.flvInput = new FlvInputBuffer(Math.min(4 * 1024 * 1024, this.decoderMemorySize - this.chunkSize));
   }
 
   async init() {
-    const ret = this.module._initDecoder(this.decoderMemorySize, 0, 0, this.quiet ? 0 : 1, 0, 0);
+    const ret = this.module._initDecoder(this.decoderMemorySize, 0, 0, this.quiet ? 0 : 1, 0, 1);
     if (ret !== 0) {
       throw new Error(`_initDecoder 失败: ${ret}`);
     }
     this.cacheBuffer = this.module._malloc(this.chunkSize);
     this.infoPtr = this.module._malloc(28);
+    this.keyPtr = this.options.playKey ? this.module.allocateUTF8(this.options.playKey) : 0;
+    this.relayPtr = this.options.relaySig ? this.module.allocateUTF8(this.options.relaySig) : 0;
     this.videoCb = this.module.addFunction((ptr, size, ts, width, height) => {
       if (!this.ffmpegMuxer) {
         this.ffmpegMuxer = new FfmpegTsMuxer({
@@ -463,19 +562,19 @@ class CameraWasmDecoder {
           this.ffmpegMuxer.stdout.pipe(process.stdout);
         }
         log(`FFmpeg muxer started: ${width}x${height} @ ${this.fps}fps`, this.quiet);
+        for (const audio of this.pendingInitialAudio) {
+          if (!this.ffmpegMuxer.enqueueAudio(audio)) throw new Error("启动音频缓存无法写入 FFmpeg");
+        }
+        this.pendingInitialAudio.length = 0;
+        this.pendingInitialAudioBytes = 0;
       }
       this.videoFrames += 1;
+      this.lastProgressAt = Date.now();
       const frame = transHeapBuffer(this.module, ptr, size);
-      if (!this.ffmpegMuxer.enqueueVideo(frame)) {
-        const error = this.ffmpegMuxer.getError();
-        if (error) {
-          throw error;
-        }
-        this.droppedVideoFrames += 1;
-        if (this.droppedVideoFrames <= 3 || this.droppedVideoFrames % 30 === 0) {
-          log(`视频写入背压过高，已丢弃 ${this.droppedVideoFrames} 帧`, this.quiet);
-        }
-      }
+      // rawvideo 不携带时间戳：按源 PTS 采样到输出 fps，否则 25 fps 会被当成 12 fps，
+      // 视频时间线跑到音频前面，最终双管道互相等待而永久背压。
+      this.pendingVideoFrames.push(...this.videoClock.sample(frame, ts));
+      this.flushVideoFrames();
       if (this.maxFrames && this.videoFrames >= this.maxFrames) {
         this.ended = true;
       }
@@ -485,6 +584,12 @@ class CameraWasmDecoder {
     });
     this.audioCb = this.module.addFunction((ptr, size, ts, duration) => {
       this.audioFrames += 1;
+      this.lastProgressAt = Date.now();
+      if (!this.ffmpegMuxer && this.audioSampleFormat) {
+        if (this.pendingInitialAudioBytes + size > this.maxPendingAudioBytes) throw new Error("等待首帧时音频缓存超过上限");
+        this.pendingInitialAudio.push(transHeapBuffer(this.module, ptr, size));
+        this.pendingInitialAudioBytes += size;
+      }
       if (this.ffmpegMuxer && this.audioSampleFormat) {
         const frame = transHeapBuffer(this.module, ptr, size);
         if (!this.ffmpegMuxer.enqueueAudio(frame)) {
@@ -492,10 +597,7 @@ class CameraWasmDecoder {
           if (error) {
             throw error;
           }
-          this.droppedAudioFrames += 1;
-          if (this.droppedAudioFrames <= 3 || this.droppedAudioFrames % 60 === 0) {
-            log(`音频写入背压过高，已丢弃 ${this.droppedAudioFrames} 帧`, this.quiet);
-          }
+          throw new Error("音频待写入缓存不足，停止管线以避免录像静默丢帧");
         }
       }
       if (this.audioFrames <= 3) {
@@ -507,9 +609,11 @@ class CameraWasmDecoder {
 
   enqueue(chunk) {
     if (chunk && chunk.length) {
-      const frame = Buffer.from(chunk);
-      this.queue.push(frame);
-      this.queuedInputBytes += frame.length;
+      // WASM 会消耗不完整 tag，之后无法恢复该帧。网络块必须先拼成完整 FLV tag。
+      for (const frame of this.flvInput.push(chunk)) {
+        this.queue.push(frame);
+        this.queuedInputBytes += frame.length;
+      }
     }
   }
 
@@ -523,7 +627,8 @@ class CameraWasmDecoder {
 
   flushInput() {
     while (this.queue.length > 0) {
-      const chunk = this.queue[0];
+      const pending = this.queue[0];
+      const chunk = pending.subarray(0, this.chunkSize);
       this.module.HEAPU8.set(chunk, this.cacheBuffer);
       const wrote = this.module._sendData(this.cacheBuffer, chunk.length);
       if (wrote < 0) {
@@ -533,40 +638,60 @@ class CameraWasmDecoder {
         break;
       }
       this.inputSize += wrote;
-      if (wrote === chunk.length) {
-        this.queuedInputBytes -= chunk.length;
+      if (!this.opened) {
+        if (this.inputSize > this.decoderMemorySize - this.chunkSize) {
+          throw new Error("解码器启动数据超过内存上限");
+        }
+        this.startupChunks.push(Buffer.from(chunk.subarray(0, wrote)));
+      }
+      if (wrote === pending.length) {
+        this.queuedInputBytes -= wrote;
         this.queue.shift();
       } else {
         this.queuedInputBytes -= wrote;
-        this.queue[0] = chunk.subarray(wrote);
-        break;
+        this.queue[0] = pending.subarray(wrote);
+        if (wrote < chunk.length) break;
       }
     }
   }
 
   maybeOpen() {
-    if (this.opened || this.opening || this.inputSize < this.minBufferSize) {
+    if (this.opened || this.opening || this.inputSize < this.nextOpenSize || !this.flvInput.ready()) {
       return;
     }
     this.opening = true;
-    const keyPtr = this.options.playKey ? this.module.allocateUTF8(this.options.playKey) : 0;
-    const relayPtr = this.options.relaySig ? this.module.allocateUTF8(this.options.relaySig) : 0;
     const ret = this.module._openDecoder(
       this.infoPtr,
       7,
       this.videoCb,
       this.audioCb,
       this.seekCb,
-      keyPtr,
+      this.keyPtr,
       this.keyType,
-      relayPtr,
+      this.relayPtr,
       0
     );
     this.opening = false;
+    if (ret === 8 && this.inputSize < 512 * 1024) {
+      // 实测碎片化 FLV 头使 open 返回 8，且之后 sendData 会返回 -1。
+      // 重建原生解码器并重放启动数据，不能在已失败的实例上直接继续写。
+      this.module._uninitDecoder();
+      const reset = this.module._initDecoder(this.decoderMemorySize, 0, 0, this.quiet ? 0 : 1, 0, 1);
+      if (reset !== 0) throw new Error(`重建解码器失败: ${reset}`);
+      for (const chunk of this.startupChunks) {
+        this.module.HEAPU8.set(chunk, this.cacheBuffer);
+        if (this.module._sendData(this.cacheBuffer, chunk.length) !== chunk.length) {
+          throw new Error("重放解码器启动数据失败");
+        }
+      }
+      this.nextOpenSize = Math.min(512 * 1024, Math.max(this.inputSize + 16 * 1024, this.inputSize * 2));
+      return;
+    }
     if (ret !== 0) {
       throw new Error(`_openDecoder 失败: ${ret}`);
     }
     this.opened = true;
+    this.startupChunks.length = 0;
     const info = Array.from(this.module.HEAP32.subarray(this.infoPtr >> 2, (this.infoPtr >> 2) + 7));
     this.videoWidth = info[2];
     this.videoHeight = info[3];
@@ -593,18 +718,33 @@ class CameraWasmDecoder {
     return formatMap[sampleFmt] || null;
   }
 
+  flushVideoFrames() {
+    while (this.pendingVideoFrames.length) {
+      const frame = this.pendingVideoFrames[0];
+      if (!this.ffmpegMuxer.enqueueVideo(frame)) {
+        if (this.ffmpegMuxer.getError()) throw this.ffmpegMuxer.getError();
+        if (frame.length > this.ffmpegMuxer.maxPendingVideoBytes) throw new Error("单帧超过视频缓存上限");
+        return false;
+      }
+      this.pendingVideoFrames.shift();
+      this.lastProgressAt = Date.now();
+    }
+    return true;
+  }
+
   pumpDecode(maxIterations = 256) {
     if (!this.opened || this.ended) {
-      return;
+      return this.ended ? "ended" : "need-input";
     }
     for (let i = 0; i < maxIterations; i += 1) {
+      if (this.ended) return "ended";
       if (this.ffmpegMuxer) {
         const muxerError = this.ffmpegMuxer.getError();
         if (muxerError) {
           throw muxerError;
         }
-        if (this.ffmpegMuxer.isBackpressured()) {
-          return;
+        if (!this.flushVideoFrames() || this.ffmpegMuxer.isBackpressured()) {
+          return "backpressure";
         }
       }
       const ret = this.module._decodeOnePacket();
@@ -612,14 +752,15 @@ class CameraWasmDecoder {
         continue;
       }
       if (ret === 9) {
-        return;
+        return "need-input";
       }
       if (ret === 7) {
         this.ended = true;
-        return;
+        return "ended";
       }
       throw new Error(`_decodeOnePacket 失败: ${ret}`);
     }
+    return "progress";
   }
 
   finish() {
@@ -631,7 +772,8 @@ class CameraWasmDecoder {
 
   async waitForMuxerExit(timeoutMs = 10000) {
     if (this.ffmpegMuxer) {
-      await this.ffmpegMuxer.waitForExit(timeoutMs);
+      const error = await this.ffmpegMuxer.waitForExit(timeoutMs);
+      if (error) throw error;
     }
   }
 }
@@ -655,7 +797,7 @@ async function* chunkFromFile(filePath, chunkSize) {
 }
 
 async function* chunkFromFetch(url, chunkSize, quiet, signal) {
-  log(`fetch stream: ${url}`, quiet);
+  log("fetch stream started", quiet);
   const response = await fetch(url, {
     headers: {
       Referer: "https://my.jia.360.cn/",
@@ -701,6 +843,8 @@ async function main() {
     segmentSeconds: args["segment-seconds"] || 0,
     segmentStrftime: Boolean(args["segment-strftime"]),
     maxFrames: args["max-frames"] || 0,
+    minBufferSize: args["min-decoder-buffer-size"] || 1,
+    chunkSize,
     maxPendingVideoBytes: args["max-pending-video-bytes"] || 8 * 1024 * 1024,
     maxPendingAudioBytes: args["max-pending-audio-bytes"] || 2 * 1024 * 1024,
     maxPendingInputBytes: args["max-pending-input-bytes"] || 2 * 1024 * 1024,
@@ -717,6 +861,19 @@ async function main() {
   }
 
   activeAbortController = new AbortController();
+  const stallTimeoutMs = Number(args["stall-timeout-ms"] || 30000);
+  let stallError = null;
+  const checkProgress = () => {
+    if (!stopRequested && Date.now() - decoder.lastProgressAt > stallTimeoutMs) {
+      stallError = stallError || new Error(`解密/编码管线超过 ${stallTimeoutMs}ms 无进展（video=${decoder.videoFrames}, audio=${decoder.audioFrames}），停止以避免空转录制`);
+      activeAbortController?.abort();
+    }
+    if (stallError) throw stallError;
+  };
+  const progressTimer = setInterval(() => {
+    try { checkProgress(); } catch (_) { /* 主循环通过 abort 或下一次检查接收错误。 */ }
+  }, Math.min(1000, stallTimeoutMs));
+  progressTimer.unref();
 
   const source = args["input-file"]
     ? chunkFromFile(path.resolve(args["input-file"]), chunkSize)
@@ -725,6 +882,7 @@ async function main() {
   try {
     for await (const chunk of source) {
       while (decoder.isBackpressured() && !decoder.ended) {
+        checkProgress();
         decoder.flushInput();
         decoder.maybeOpen();
         decoder.pumpDecode(32);
@@ -742,20 +900,31 @@ async function main() {
       }
     }
   } catch (error) {
+    if (stallError) throw stallError;
     if (!stopRequested || error.name !== "AbortError") {
       throw error;
     }
   }
 
-  while (!decoder.ended && (decoder.queue.length > 0 || decoder.isBackpressured())) {
+  // JS 输入队列为空不代表 WASM 内部已排空。必须持续解码至原生层要求新输入。
+  while (!decoder.ended) {
+    checkProgress();
     decoder.flushInput();
     decoder.maybeOpen();
-    decoder.pumpDecode(32);
+    const state = decoder.pumpDecode(32);
+    if (state === "need-input" && decoder.queue.length === 0) break;
     await sleep(10);
   }
 
+  while (!decoder.flushVideoFrames()) {
+    checkProgress();
+    await sleep(10);
+  }
   decoder.finish();
   await decoder.waitForMuxerExit(8000);
+  clearInterval(progressTimer);
+  if (!stopRequested && !decoder.videoFrames) throw new Error("输入结束但未解码出视频帧");
+  if (!stopRequested && decoder.flvInput.pending.length) throw new Error("输入结束时存在不完整 FLV tag");
   log(
     `decoder finished: videoFrames=${decoder.videoFrames} audioFrames=${decoder.audioFrames} droppedVideoFrames=${decoder.droppedVideoFrames} droppedAudioFrames=${decoder.droppedAudioFrames}`,
     quiet
@@ -775,9 +944,7 @@ function requestGracefulStop() {
     return;
   }
   stopRequested = true;
-  if (activeDecoder) {
-    activeDecoder.finish();
-  }
+  // 主循环收到 abort 后排空 WASM 和帧队列，再向编码器发送 EOF。
   if (activeAbortController) {
     activeAbortController.abort();
   }
@@ -801,28 +968,33 @@ function cleanupControlInput() {
 
 async function shutdown(signalName) {
   requestGracefulStop();
+  let exitCode = 0;
   try {
     if (activeDecoder) {
       await activeDecoder.waitForMuxerExit(8000);
     }
   } catch (error) {
+    exitCode = 1;
     if (activeDecoder && activeDecoder.ffmpegMuxer) {
       activeDecoder.ffmpegMuxer.terminate(signalName);
     }
   } finally {
     cleanupControlInput();
-    process.exit(0);
+    process.exit(exitCode);
   }
 }
 
-process.once("SIGINT", () => void shutdown("SIGINT"));
-process.once("SIGTERM", () => void shutdown("SIGTERM"));
+if (require.main === module) {
+  process.once("SIGINT", () => void shutdown("SIGINT"));
+  process.once("SIGTERM", () => void shutdown("SIGTERM"));
+  main().catch((error) => {
+    if (activeDecoder && activeDecoder.ffmpegMuxer) {
+      activeDecoder.ffmpegMuxer.terminate("SIGTERM");
+    }
+    activeDecoder = null;
+    process.stderr.write(`${error.stack || error.message}\n`);
+    process.exit(1);
+  });
+}
 
-main().catch((error) => {
-  if (activeDecoder && activeDecoder.ffmpegMuxer) {
-    activeDecoder.ffmpegMuxer.terminate("SIGTERM");
-  }
-  activeDecoder = null;
-  process.stderr.write(`${error.stack || error.message}\n`);
-  process.exit(1);
-});
+module.exports = { CameraWasmDecoder, FfmpegTsMuxer, FlvInputBuffer, VideoFrameClock, loadLibffmpeg };

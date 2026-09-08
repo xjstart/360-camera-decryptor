@@ -471,6 +471,9 @@ async function stopRecording() {
             throw new Error(result.error || `HTTP ${response.status}`);
         }
         renderRecordingStatus(result.recording || { sn, state: 'idle' });
+        if (result.recording && result.recording.state === 'failed') {
+            throw new Error(result.recording.error || '录像异常结束');
+        }
         log(result.stopped ? '录像已停止' : '当前摄像机没有活动录像', 'success');
     } catch (error) {
         log(`停止录像失败: ${error.message}`, 'error');
@@ -643,6 +646,9 @@ async function stopBackendDecryptedStream() {
         backendStreamAbortController = null;
     }
     if (video) {
+        video.ontimeupdate = null;
+        video.onprogress = null;
+        video.playbackRate = 1;
         video.pause();
         video.removeAttribute('src');
         video.load();
@@ -730,6 +736,9 @@ function startBackendFmp4Playback(video, streamUrl) {
     backendStreamAbortController = null;
     backendStreamObjectUrl = '';
     video.crossOrigin = 'anonymous';
+    // 只追赶浏览器已收到的直播数据；公共源仍完整送给录像消费者。
+    video.ontimeupdate = () => chaseBackendLiveEdge(video);
+    video.onprogress = () => chaseBackendLiveEdge(video);
     video.src = streamUrl;
     video.load();
     updateBackendPlayerStatus('接收数据中...');
@@ -737,6 +746,28 @@ function startBackendFmp4Playback(video, streamUrl) {
         updateBackendPlayerStatus('等待手动播放');
         log(`后端解密流等待手动播放: ${error.message}`, 'warning');
     });
+}
+
+function chaseBackendLiveEdge(video) {
+    if (video.paused || video.ended || video.seeking || !video.buffered.length) {
+        video.playbackRate = 1;
+        return;
+    }
+    const last = video.buffered.length - 1;
+    const edge = video.buffered.end(last);
+    const lag = edge - video.currentTime;
+    const target = Math.max(video.buffered.start(last), edge - 0.5);
+    if (lag > 1.5) {
+        for (let i = 0; i < video.seekable.length; i += 1) {
+            if (target >= video.seekable.start(i) && target <= video.seekable.end(i)) {
+                video.currentTime = target;
+                video.playbackRate = 1;
+                return;
+            }
+        }
+    }
+    // HTTP 无限 MP4 有时没有 seekable 范围，此时用温和加速消化积压。
+    video.playbackRate = lag > 0.9 ? 1.05 : 1;
 }
 
 // ==================== 测试配置 ====================
@@ -776,7 +807,7 @@ function testConfig(configId) {
             keyType: config.keyType,
             isLive: true,
             autoplay: true,
-            logLevel: 2,
+            logLevel: 0,
             renderType: 'all',
             // 与 360 官网 mylist.js 的直播低延迟配置保持一致。库默认需要先
             // 累积 512 KiB 才打开解码器，低码率摄像机上会直接形成 10-30 秒延迟。
@@ -829,18 +860,16 @@ function testConfig(configId) {
                 lastTelemetryAt = now;
 
                 const data = event && event.data ? event.data : {};
-                const decoderMs = Math.max(
-                    Number(data.pcmDecoderCacheDuration || 0),
-                    Number(data.yuvDecoderCacheDuration || 0)
-                );
-                const renderMs = Math.max(
-                    Number(data.pcmRenderCacheDuration || 0),
-                    Number(data.yuvRenderCacheDuration || 0)
+                const decoderMs = Math.max(Number(data.pcmDecoderCacheDuration || 0), Number(data.yuvDecoderCacheDuration || 0));
+                const renderMs = Math.max(Number(data.pcmRenderCacheDuration || 0), Number(data.yuvRenderCacheDuration || 0));
+                const bufferedMs = Math.max(
+                    Number(data.pcmDecoderCacheDuration || 0) + Number(data.pcmRenderCacheDuration || 0),
+                    Number(data.yuvDecoderCacheDuration || 0) + Number(data.yuvRenderCacheDuration || 0)
                 );
                 if (decoderMs > 0 || renderMs > 0) {
                     log(
-                        `QhwwPlayer 缓冲观测: decoder=${Math.round(decoderMs)}ms, render=${Math.round(renderMs)}ms`,
-                        decoderMs > 3000 ? 'warning' : 'info'
+                        `QhwwPlayer 缓冲观测: decoder=${Math.round(decoderMs)}ms, render=${Math.round(renderMs)}ms, total=${Math.round(bufferedMs)}ms（非端到端延迟）`,
+                        bufferedMs > 1500 ? 'warning' : 'info'
                     );
                 }
             }

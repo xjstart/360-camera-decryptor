@@ -107,12 +107,15 @@ class CameraDecryptorFixed {
             keyType: config.keyType || 0,
             isLive: true,
             autoplay: true,
-            logLevel: 2,  // 增加日志级别
+            logLevel: 0,
             // 尝试其他可能影响颜色的参数
             renderType: 'all',  // 渲染类型
-            resample: 0,        // 重采样
+            resample: 1,
             sei: 0,             // SEI
-            minDecoderBufferSize: 524288,
+            minDecoderBufferSize: 1,
+            waitingPcmDur: 50,
+            waitingYuvNum: 1,
+            delayTimeLimit: 1000,
             maxDecoderVCacheLength: 300,
             maxDecoderACacheLength: 500
         };
@@ -122,7 +125,6 @@ class CameraDecryptorFixed {
             playerConfig.keyForKey = config.keyForKey;
         }
 
-        console.log('播放器配置:', playerConfig);
         console.log('使用配置:', config.description);
 
         const player = new QhwwPlayer(playerConfig);
