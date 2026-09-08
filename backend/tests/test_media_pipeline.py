@@ -7,6 +7,8 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
+from queue import Queue
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import unittest
 from pathlib import Path
@@ -14,6 +16,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "backend"))
 from app.decrypt_commands import build_playback_remux_command, build_recording_remux_command
+from app.recordings import RecordingManager
 
 WASM = ROOT / "backend/.cache/libffmpeg.js"
 
@@ -21,6 +24,54 @@ WASM = ROOT / "backend/.cache/libffmpeg.js"
 @unittest.skipUnless(all(shutil.which(cmd) for cmd in ("node", "ffmpeg", "ffprobe")) and WASM.is_file(),
                      "requires Node, FFmpeg, ffprobe and cached libffmpeg.js")
 class MediaPipelineTests(unittest.TestCase):
+    def test_recording_reconnect_produces_two_complete_real_mp4_files(self):
+        class Source:
+            def __init__(self):
+                self.queue = Queue()
+            def subscribe(self, **kwargs):
+                return 1, self.queue
+            def unsubscribe(self, *args, **kwargs):
+                self.queue.put(None)
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            transport = self.run_command([
+                "ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=160x120:rate=12",
+                "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=16000", "-t", "4",
+                "-c:v", "libx264", "-preset", "ultrafast", "-g", "12", "-c:a", "aac",
+                "-f", "mpegts", "pipe:1",
+            ])
+            first, second = Source(), Source()
+            manager = RecordingManager(reconnect_delay=0.01)
+            try:
+                manager.start(
+                    sn="media-recovery", config_id=0, segment_seconds=30, output_root=root,
+                    cmd_factory=lambda pattern: build_recording_remux_command(output_path=pattern, segment_seconds=30),
+                    pipeline_mode="shared", source_session=first, source_factory=lambda: second,
+                )
+                first.queue.put(transport)
+                first.queue.put(None)
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    status = manager.status("media-recovery")
+                    if status["state"] == "recording" and status["reconnect_count"] == 1:
+                        break
+                    time.sleep(0.01)
+                self.assertEqual(status["reconnect_count"], 1)
+                self.assertEqual(status["state"], "recording")
+                second.queue.put(transport)
+                self.assertEqual(manager.stop("media-recovery")[1]["state"], "stopped")
+                files = list(root.glob("*/manual-*.mp4"))
+                self.assertEqual(len(files), 2)
+                for file in files:
+                    streams = self.streams(file)
+                    video = next(s for s in streams if s["codec_type"] == "video")
+                    self.assertEqual(int(video["nb_read_frames"]), 48)
+                    self.assertAlmostEqual(float(video["duration"]), 4.0, places=1)
+                    self.assertTrue(any(s["codec_type"] == "audio" for s in streams))
+            finally:
+                manager.close_all()
+
     def run_command(self, command, **kwargs):
         return subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20, **kwargs).stdout
 

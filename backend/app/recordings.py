@@ -17,7 +17,7 @@ from typing import Any, Optional
 from .stream_sessions import terminate_process_tree
 
 
-ACTIVE_STATES = {"recording", "stopping"}
+ACTIVE_STATES = {"recording", "reconnecting", "stopping"}
 
 
 class RecordingConflict(RuntimeError):
@@ -53,22 +53,30 @@ class RecordingTask:
     stop_requested: bool = False
     stderr_tail: list[str] = field(default_factory=list)
     stop_event: Event = field(default_factory=Event)
+    source_factory: Optional[Any] = None
+    cmd_factory: Optional[Any] = None
+    output_pattern: Optional[Path] = None
+    max_pending_input_bytes: int = 16 * 1024 * 1024
+    source_ended: bool = False
+    reconnect_count: int = 0
+    last_reconnect_reason: Optional[str] = None
 
 
 class RecordingManager:
     """保证每台摄像机最多运行一个独立录像进程。"""
 
-    def __init__(self, *, logger: Optional[Any] = None, cwd: Optional[Path] = None, stop_timeout: float = 10.0):
+    def __init__(self, *, logger: Optional[Any] = None, cwd: Optional[Path] = None, stop_timeout: float = 10.0, reconnect_delay: float = 2.0):
         self._lock = Lock()
         self._logger = logger
         self._cwd = cwd
         self._stop_timeout = stop_timeout
+        self._reconnect_delay = reconnect_delay
         self._tasks: dict[str, RecordingTask] = {}
 
     def has_active(self, sn: str) -> bool:
         with self._lock:
             task = self._tasks.get(sn)
-            return bool(task and task.state in ACTIVE_STATES and task.proc.poll() is None)
+            return bool(task and task.state in ACTIVE_STATES)
 
     def start(
         self,
@@ -80,6 +88,7 @@ class RecordingManager:
         cmd_factory: Any,
         pipeline_mode: str = "independent",
         source_session: Optional[Any] = None,
+        source_factory: Optional[Any] = None,
         max_pending_input_bytes: int = 16 * 1024 * 1024,
     ) -> dict[str, Any]:
         """创建目录并启动录像；cmd_factory 接收输出文件模式。"""
@@ -89,7 +98,7 @@ class RecordingManager:
             raise ValueError("共享录像模式缺少解密流会话")
         with self._lock:
             current = self._tasks.get(sn)
-            if current and current.state in ACTIVE_STATES and current.proc.poll() is None:
+            if current and current.state in ACTIVE_STATES:
                 raise RecordingConflict(f"摄像机 {sn} 已在录制")
 
             recording_id = build_recording_id()
@@ -119,6 +128,10 @@ class RecordingManager:
                 proc=proc,
                 pipeline_mode=pipeline_mode,
                 source_session=source_session,
+                source_factory=source_factory,
+                cmd_factory=cmd_factory,
+                output_pattern=output_pattern,
+                max_pending_input_bytes=max_pending_input_bytes,
             )
             if pipeline_mode == "shared":
                 def on_source_drop(reason: str) -> None:
@@ -139,10 +152,7 @@ class RecordingManager:
                 task.source_queue = source_queue
             self._tasks[sn] = task
 
-        Thread(target=self._drain_stderr, args=(task,), daemon=True).start()
         Thread(target=self._monitor, args=(task,), daemon=True).start()
-        if pipeline_mode == "shared":
-            Thread(target=self._feed_shared_stream, args=(task,), daemon=True).start()
         Thread(target=self._maintain_date_directories, args=(task,), daemon=True).start()
         if self._logger:
             self._logger.info("recording[%s] started id=%s segment=%ss", sn, recording_id, segment_seconds)
@@ -158,12 +168,13 @@ class RecordingManager:
     def stop(self, sn: str) -> tuple[bool, dict[str, Any]]:
         with self._lock:
             task = self._tasks.get(sn)
-            if task is None or task.state not in ACTIVE_STATES or task.proc.poll() is not None:
+            if task is None or task.state not in ACTIVE_STATES:
                 return False, {"sn": sn, "state": "idle"} if task is None else self._serialize(task)
             if task.state == "stopping":
                 return False, self._serialize(task)
             task.state = "stopping"
             task.stop_requested = True
+            task.stop_event.set()
 
         graceful = False
         try:
@@ -201,16 +212,95 @@ class RecordingManager:
         return len(sns)
 
     def _monitor(self, task: RecordingTask) -> None:
-        return_code = task.proc.wait()
-        if task.source_session is not None and task.source_subscriber_id is not None:
-            task.source_session.unsubscribe(task.source_subscriber_id)
+        while True:
+            stderr_thread = Thread(target=self._drain_stderr, args=(task,), daemon=True)
+            stderr_thread.start()
+            feeder = None
+            if task.pipeline_mode == "shared":
+                feeder = Thread(target=self._feed_shared_stream, args=(task,), daemon=True)
+                feeder.start()
+            return_code = task.proc.wait()
+            if task.source_session is not None and task.source_subscriber_id is not None:
+                task.source_session.unsubscribe(task.source_subscriber_id)
+            # Old workers must finish before task.proc/session can be replaced.
+            if feeder is not None:
+                feeder.join()
+            stderr_thread.join()
             task.source_subscriber_id = None
-        if task.proc.stdin:
+            if task.proc.stdin:
+                try:
+                    task.proc.stdin.close()
+                except OSError:
+                    pass
+            disk_failure = any(marker in line.lower() for line in task.stderr_tail for marker in (
+                "no space left", "permission denied", "input/output error", "error writing", "disk full",
+            ))
+            if disk_failure and not task.error:
+                task.error = "录像写入失败: " + task.stderr_tail[-1]
+            if (task.source_ended and task.source_factory is not None
+                    and not task.error and not disk_failure and not task.stop_requested):
+                if self._reconnect(task):
+                    continue
+            if task.source_ended and not task.stop_requested and not task.error:
+                task.error = "公共解密流已结束"
+            self._finalize(task, return_code)
+            return
+
+    def _reconnect(self, task: RecordingTask) -> bool:
+        """Keep the logical recording alive; refresh outside the lock so stop stays responsive."""
+        with self._lock:
+            if task.stop_requested:
+                return False
+            task.state = "reconnecting"
+            task.last_reconnect_reason = "公共解密流已结束，正在刷新播放信息并续录"
+        failures = 0
+        while not task.stop_event.wait(min(30.0, self._reconnect_delay * (2 ** min(failures, 4)))):
+            with self._lock:
+                task.reconnect_count += 1
             try:
-                task.proc.stdin.close()
-            except OSError:
-                pass
-        self._finalize(task, return_code)
+                source = task.source_factory()
+                if task.stop_event.is_set():
+                    return False
+                def on_drop(reason: str) -> None:
+                    with self._lock:
+                        if not task.stop_requested and task.error is None:
+                            task.error = f"录像输入缓存溢出: {reason}"
+                subscriber_id, queue = source.subscribe(
+                    kind="recording", max_pending_bytes=task.max_pending_input_bytes, on_drop=on_drop,
+                )
+            except Exception as exc:
+                # Do not expose refreshed URLs or credentials in status/logs.
+                with self._lock:
+                    task.last_reconnect_reason = f"刷新解密源失败（{type(exc).__name__}），稍后重试"
+                failures += 1
+                continue
+            with self._lock:
+                if task.stop_requested:
+                    source.unsubscribe(subscriber_id)
+                    return False
+                suffix = task.recording_id.rsplit("-", 1)[-1]
+                pattern = task.output_pattern.with_name(
+                    f"manual-%Y-%m-%d_%H-%M-%S-r{task.reconnect_count:04d}-{suffix}.mp4"
+                )
+                try:
+                    self._ensure_date_directory(task.output_root)
+                    proc = subprocess.Popen(
+                        task.cmd_factory(pattern), stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE, cwd=os.fspath(self._cwd or os.getcwd()), start_new_session=True,
+                    )
+                except Exception as exc:
+                    source.unsubscribe(subscriber_id)
+                    task.error = f"续录进程启动失败（{type(exc).__name__}）"
+                    return False
+                task.proc = proc
+                task.source_session = source
+                task.source_subscriber_id = subscriber_id
+                task.source_queue = queue
+                task.source_ended = False
+                task.stderr_tail.clear()
+                task.state = "recording"
+            return True
+        return False
 
     def _feed_shared_stream(self, task: RecordingTask) -> None:
         """把公共 MPEG-TS 送入录像 remux；结束订阅即向 ffmpeg 发送 EOF。"""
@@ -222,8 +312,8 @@ class RecordingManager:
                 if chunk is None:
                     if not task.stop_requested:
                         with self._lock:
-                            if task.error is None:
-                                task.error = "公共解密流已结束"
+                            if task.error is None and task.proc.poll() is None:
+                                task.source_ended = True
                     break
                 task.proc.stdin.write(chunk)
                 task.proc.stdin.flush()
@@ -294,6 +384,8 @@ class RecordingManager:
             "output_dir": str(current_output_dir),
             "relative_output_dir": str(current_output_dir),
             "error": task.error,
+            "reconnect_count": task.reconnect_count,
+            "last_reconnect_reason": task.last_reconnect_reason,
         }
 
     @staticmethod

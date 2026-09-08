@@ -268,7 +268,7 @@ async function loadRecordingSettings() {
         if (!response.ok || result.error) {
             throw new Error(result.error || `HTTP ${response.status}`);
         }
-        if (recordingActiveState !== 'recording' && recordingActiveState !== 'stopping') {
+        if (!['recording', 'reconnecting', 'stopping'].includes(recordingActiveState)) {
             const savedPath = localStorage.getItem('cameraDecryptorRecordingDir') || '';
             pathInput.value = savedPath || result.recording_dir || '';
             durationInput.value = result.default_segment_seconds || 1800;
@@ -305,11 +305,12 @@ function scheduleRecordingPoll(sn) {
 
 function renderRecordingStatus(recording) {
     const state = recording.state || 'idle';
-    const active = state === 'recording' || state === 'stopping';
+    const active = ['recording', 'reconnecting', 'stopping'].includes(state);
     recordingActiveState = state;
     const stateLabels = {
         idle: '空闲',
         recording: '录制中',
+        reconnecting: '重连中',
         stopping: '停止中',
         stopped: '已停止',
         failed: '失败'
@@ -322,7 +323,7 @@ function renderRecordingStatus(recording) {
     const actionButton = document.getElementById('recording-action-button');
     const durationInput = document.getElementById('recording-segment-seconds');
     const pathInput = document.getElementById('recording-output-root');
-    if (state === 'recording') {
+    if (state === 'recording' || state === 'reconnecting') {
         actionButton.textContent = '停止录像';
         actionButton.dataset.mode = 'stop';
         actionButton.disabled = false;
@@ -353,8 +354,14 @@ function renderRecordingStatus(recording) {
     if (recording.error) {
         message.textContent = recording.error;
         message.style.color = '#b91c1c';
+    } else if (state === 'reconnecting') {
+        message.textContent = `${recording.last_reconnect_reason || '解密源中断，正在自动续录'}（已尝试 ${recording.reconnect_count || 0} 次）。可随时停止录像。`;
+        message.style.color = '';
     } else if (active) {
         message.textContent = `正在录制，每 ${formatSegmentDuration(recording.segment_seconds)} 生成一个 MP4 分片。点击“停止录像”即可结束。`;
+        if (recording.reconnect_count) {
+            message.textContent += ` 已自动重连 ${recording.reconnect_count} 次，断流期间可能存在缺口。`;
+        }
         message.style.color = '';
     } else if (state === 'stopped') {
         message.textContent = '录像已停止，最后一个 MP4 分片已完成封装。';

@@ -857,6 +857,20 @@ def start_recording() -> Response:
         start_options: Dict[str, Any] = {}
         if shared_pipeline:
             fps = "12"
+            def source_factory():
+                refreshed_payload = get_decrypt_payload(sn, force_refresh=True)
+                refreshed_options = service.get_decrypt_stream_options()
+                return decrypt_session_manager.get_or_create(
+                    key=build_decrypt_source_key(config_id, sn, fps, refreshed_payload, shared=True),
+                    group_key=build_decrypt_group_key(config_id, sn),
+                    label=f"decrypt-source[{config_id}/{sn}]",
+                    idle_timeout_seconds=refreshed_options["decrypt_idle_timeout_seconds"],
+                    cmd=build_shared_decrypt_command(
+                        config_id=config_id, payload=refreshed_payload,
+                        decrypt_options=refreshed_options, fps=fps,
+                    ),
+                )
+
             source_session = decrypt_session_manager.get_or_create(
                 key=build_decrypt_source_key(config_id, sn, fps, payload, shared=True),
                 group_key=build_decrypt_group_key(config_id, sn),
@@ -880,6 +894,7 @@ def start_recording() -> Response:
             start_options = {
                 "pipeline_mode": "shared",
                 "source_session": source_session,
+                "source_factory": source_factory,
                 "max_pending_input_bytes": decrypt_options["recording_max_pending_input_bytes"],
             }
         else:

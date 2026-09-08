@@ -32,3 +32,29 @@ test('paused or seeking playback is not repositioned', () => {
         assert.equal(media.currentTime, 5);
     }
 });
+
+test('recording reconnect keeps polling and manual stop available', () => {
+    const elements = new Map();
+    let polls = 0;
+    const recordingContext = vm.createContext({
+        document: { getElementById(id) {
+            if (!elements.has(id)) elements.set(id, { dataset: {}, style: {}, classList: { add() {}, remove() {} } });
+            return elements.get(id);
+        } },
+        localStorage: { setItem() {} },
+        formatRecordingTime: value => value || '-',
+        formatSegmentDuration: value => String(value),
+        updateRecordingConfigDisplay() {},
+        scheduleRecordingPoll() { polls++; },
+        stopRecordingPolling() { throw new Error('reconnect must keep polling'); },
+        getRecordingCameraSn: () => 'camera',
+    });
+    vm.runInContext(source.slice(source.indexOf('function renderRecordingStatus('), source.indexOf('async function refreshRecordingStatus(')), recordingContext);
+    recordingContext.renderRecordingStatus({ state: 'reconnecting', reconnect_count: 2, segment_seconds: 1800 });
+    assert.equal(elements.get('recording-state-badge').textContent, '重连中');
+    assert.equal(elements.get('recording-action-button').dataset.mode, 'stop');
+    assert.equal(elements.get('recording-action-button').disabled, false);
+    assert.equal(elements.get('recording-segment-seconds').disabled, true);
+    assert.equal(polls, 1);
+    assert.match(elements.get('recording-message').textContent, /2/);
+});

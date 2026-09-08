@@ -7,6 +7,7 @@ import unittest
 from datetime import datetime
 from pathlib import Path
 from queue import Queue
+from threading import Event
 from unittest.mock import patch
 
 
@@ -217,6 +218,128 @@ class RecordingManagerTests(unittest.TestCase):
             status = self.manager.status("camera-source-failed")
         self.assertEqual(status["state"], "failed")
         self.assertIn("公共解密流已结束", status["error"])
+
+    def start_recoverable(self, source, factory):
+        self.manager._reconnect_delay = 0.01
+        return self.manager.start(
+            sn="recovery", config_id=0, segment_seconds=10, output_root=self.root,
+            cmd_factory=lambda pattern: [sys.executable, "-u", "-c", READ_SHARED_STREAM_SCRIPT, str(pattern)],
+            pipeline_mode="shared", source_session=source, source_factory=factory,
+        )
+
+    def wait_status(self, predicate):
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            status = self.manager.status("recovery")
+            if predicate(status):
+                return status
+            time.sleep(0.01)
+        self.fail(f"Timed out waiting for recovery: {status}")
+
+    def test_source_reconnect_preserves_segments_and_task_identity(self):
+        first, second = FakeSourceSession(), FakeSourceSession()
+        started = self.start_recoverable(first, lambda: second)
+        first.queue.put(b"first-generation")
+        first.queue.put(None)
+        status = self.wait_status(lambda s: s["reconnect_count"] == 1 and s["state"] == "recording")
+        self.assertEqual(status["recording_id"], started["recording_id"])
+        self.assertEqual(status["started_at"], started["started_at"])
+        second.queue.put(b"second-generation")
+        stopped, status = self.manager.stop("recovery")
+        self.assertTrue(stopped)
+        self.assertEqual(status["state"], "stopped")
+        self.assertEqual(status["segment_count"], 2)
+        self.assertEqual({p.read_bytes() for p in self.root.glob("*/manual-*.mp4")},
+                         {b"first-generation", b"second-generation"})
+
+    def test_refresh_failures_retry_without_leaking_credentials(self):
+        first, second = FakeSourceSession(), FakeSourceSession()
+        calls = []
+        def refresh():
+            calls.append(1)
+            if len(calls) <= 2:
+                raise RuntimeError("https://private-url/?playKey=secret")
+            return second
+        self.start_recoverable(first, refresh)
+        first.queue.put(None)
+        status = self.wait_status(lambda s: s["reconnect_count"] == 3 and s["state"] == "recording")
+        self.assertNotIn("secret", str(status))
+        self.assertIsNone(status["error"])
+
+    def test_stop_during_refresh_prevents_late_restart_and_duplicate(self):
+        first, second = FakeSourceSession(), FakeSourceSession()
+        entered, release, returned = Event(), Event(), Event()
+        def refresh():
+            entered.set()
+            release.wait(3)
+            returned.set()
+            return second
+        self.start_recoverable(first, refresh)
+        first.queue.put(None)
+        try:
+            self.assertTrue(entered.wait(2))
+            self.assertTrue(self.manager.has_active("recovery"))
+            with self.assertRaises(RecordingConflict):
+                self.start_recoverable(second, refresh)
+            stopped, status = self.manager.stop("recovery")
+            self.assertTrue(stopped)
+            self.assertEqual(status["state"], "stopped")
+        finally:
+            release.set()
+        self.assertTrue(returned.wait(2))
+        time.sleep(0.05)
+        self.assertEqual(second.subscriber_id, 0)
+        self.assertEqual(self.manager.status("recovery")["state"], "stopped")
+
+    def test_stop_during_backoff_cancels_refresh(self):
+        first = FakeSourceSession()
+        calls = []
+        self.start_recoverable(first, lambda: calls.append(1))
+        self.manager._reconnect_delay = 60
+        first.queue.put(None)
+        self.wait_status(lambda s: s["state"] == "reconnecting")
+        self.assertEqual(self.manager.stop("recovery")[1]["state"], "stopped")
+        self.assertEqual(calls, [])
+
+    def test_source_closing_before_subscription_retries(self):
+        first, closed, second = FakeSourceSession(), FakeSourceSession(), FakeSourceSession()
+        def subscribe(**kwargs):
+            raise RuntimeError("decrypt session already closed")
+        closed.subscribe = subscribe
+        sources = iter([closed, second])
+        self.start_recoverable(first, lambda: next(sources))
+        first.queue.put(None)
+        self.wait_status(lambda s: s["reconnect_count"] == 2 and s["state"] == "recording")
+
+    def test_disk_failure_after_source_eof_does_not_reconnect(self):
+        source = FakeSourceSession()
+        calls = []
+        self.manager.start(
+            sn="recovery", config_id=0, segment_seconds=10, output_root=self.root,
+            cmd_factory=lambda pattern: [sys.executable, "-u", "-c",
+                "import sys; sys.stdin.buffer.read(); print('No space left on device', file=sys.stderr); sys.exit(1)"],
+            pipeline_mode="shared", source_session=source, source_factory=lambda: calls.append(1),
+        )
+        source.queue.put(None)
+        status = self.wait_status(lambda s: s["state"] == "failed")
+        self.assertIn("No space left", status["error"])
+        self.assertEqual(calls, [])
+
+    def test_subscriber_overflow_is_not_silently_retried(self):
+        first = FakeSourceSession()
+        callbacks = []
+        original_subscribe = first.subscribe
+        def subscribe(**kwargs):
+            callbacks.append(kwargs["on_drop"])
+            return original_subscribe(**kwargs)
+        first.subscribe = subscribe
+        calls = []
+        self.start_recoverable(first, lambda: calls.append(1))
+        callbacks[0]("too slow")
+        first.queue.put(None)
+        status = self.wait_status(lambda s: s["state"] == "failed")
+        self.assertIn("缓存溢出", status["error"])
+        self.assertEqual(calls, [])
 
 
 if __name__ == "__main__":

@@ -25,6 +25,7 @@ class FakeRecordingManager:
         return self.active
 
     def start(self, **kwargs):
+        self.start_kwargs = kwargs
         if self.active:
             raise RecordingConflict("already recording")
         self.active = True
@@ -198,6 +199,22 @@ class RecordingApiTests(unittest.TestCase):
             response = self.client.post("/api/decrypted-stream/0/camera-1/stop")
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.get_json()["source_kept_alive"])
+
+    def test_reconnect_refreshes_play_info_and_source_key(self):
+        sessions = FakeDecryptSessionManager()
+        refreshed = dict(self.payload, flashUrl="https://example.test/fresh", playKey="fresh-key")
+        with (
+            patch("app.service.service.share_decrypt_session_between_playback_and_recording", return_value=True),
+            patch("app.service.decrypt_session_manager", sessions),
+            patch("app.service.get_decrypt_payload", side_effect=[self.payload, refreshed]) as get_payload,
+        ):
+            response = self.client.post("/api/recordings/start", json={"sn": "camera-1"})
+            self.assertEqual(response.status_code, 201)
+            self.fake_manager.start_kwargs["source_factory"]()
+            get_payload.assert_called_with("camera-1", force_refresh=True)
+        self.assertEqual(len(sessions.calls), 2)
+        self.assertNotEqual(sessions.calls[0]["key"], sessions.calls[1]["key"])
+        self.assertIn("https://example.test/fresh", sessions.calls[1]["cmd"])
 
 
 if __name__ == "__main__":
